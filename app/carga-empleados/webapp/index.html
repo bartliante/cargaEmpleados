@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Carga de Empleados</title>
+	<style>
+		html, body {
+			height: 100%;
+			margin: 0;
+		}
+	</style>
+	<script
+		id="sap-ui-bootstrap"
+		src="https://sapui5.hana.ondemand.com/resources/sap-ui-core.js"
+		data-sap-ui-theme="sap_horizon"
+		data-sap-ui-libs="sap.m,sap.ui.unified,sap.ui.table"
+		data-sap-ui-compatVersion="edge"
+		data-sap-ui-async="true"
+		data-sap-ui-frameOptions="trusted"
+		data-sap-ui-resourceroots='{"cargaempleados": "./"}'
+	></script>
+	<script>
+		sap.ui.getCore().attachInit(function () {
+			sap.ui.require(["sap/ui/core/ComponentContainer"], function (ComponentContainer) {
+				new ComponentContainer({
+					name: "cargaempleados",
+					settings: { id: "cargaempleados" },
+					manifest: true,
+					async: true,
+					height: "100%",
+					width: "100%"
+				}).placeAt("content");
+			});
+		});
+	</script>
+</head>
+<body class="sapUiBody" id="content">
+</body>
+</html>

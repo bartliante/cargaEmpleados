@@ -1,0 +1,51 @@
+{
+	"_version": "1.59.0",
+	"sap.app": {
+		"id": "cargaempleados",
+		"type": "application",
+		"i18n": "i18n/i18n.properties",
+		"title": "{{appTitle}}",
+		"description": "{{appDescription}}",
+		"applicationVersion": {
+			"version": "1.0.0"
+		}
+	},
+	"sap.ui": {
+		"technology": "UI5",
+		"deviceTypes": {
+			"desktop": true,
+			"tablet": true,
+			"phone": true
+		}
+	},
+	"sap.ui5": {
+		"rootView": {
+			"viewName": "cargaempleados.view.Main",
+			"type": "XML",
+			"id": "app",
+			"height": "100%",
+			"width": "100%"
+		},
+		"dependencies": {
+			"minUI5Version": "1.120.0",
+			"libs": {
+				"sap.m": {},
+				"sap.ui.core": {},
+				"sap.ui.unified": {},
+				"sap.ui.table": {}
+			}
+		},
+		"models": {
+			"i18n": {
+				"type": "sap.ui.model.resource.ResourceModel",
+				"settings": {
+					"bundleName": "cargaempleados.i18n.i18n"
+				}
+			}
+		},
+		"contentDensities": {
+			"compact": true,
+			"cozy": true
+		}
+	}
+}

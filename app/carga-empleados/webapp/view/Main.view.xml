@@ -1,0 +1,83 @@
+<mvc:View
+	controllerName="cargaempleados.controller.Main"
+	xmlns:mvc="sap.ui.core.mvc"
+	xmlns="sap.m"
+	xmlns:unified="sap.ui.unified"
+	xmlns:table="sap.ui.table"
+	xmlns:core="sap.ui.core"
+	displayBlock="true"
+>
+	<Page id="page" title="{i18n>pageTitle}" showHeader="true" class="sapUiResponsiveContentPadding">
+		<content>
+			<Panel id="uploadPanel" expandable="true" expanded="true" class="sapUiSmallMarginBottom">
+				<headerToolbar>
+					<Toolbar>
+						<Title text="{i18n>uploadPanelTitle}"/>
+						<ToolbarSpacer/>
+						<Button id="btnPreview" text="{i18n>btnPreview}" type="Emphasized" enabled="{ui>/previewEnabled}" press=".onPreview"/>
+						<Button id="btnClear" text="{i18n>btnClear}" enabled="{ui>/clearEnabled}" press=".onClear"/>
+					</Toolbar>
+				</headerToolbar>
+				<content>
+					<VBox class="sapUiSmallMarginBottom">
+						<Label text="{i18n>fileUploaderLabel}" labelFor="fileUploader"/>
+						<unified:FileUploader
+							id="fileUploader"
+							name="csvFile"
+							uploadUrl=""
+							fileType="csv"
+							placeholder="{i18n>fileUploaderPlaceholder}"
+							typeMissmatch=".onTypeMismatch"
+							change=".onFileChange"
+							width="24rem"
+						/>
+					</VBox>
+					<VBox class="sapUiSmallMarginBottom">
+						<Label text="{i18n>batchModeLabel}" labelFor="switchBatchMode"/>
+						<Switch id="switchBatchMode" state="{ui>/batchMode}"/>
+					</VBox>
+					<VBox class="sapUiSmallMarginBottom" visible="{= !${ui>/batchMode} }">
+						<Label text="{i18n>purgeModeLabel}" labelFor="switchPurgeMode"/>
+						<Switch id="switchPurgeMode" state="{ui>/purgeMode}"/>
+					</VBox>
+					<VBox class="sapUiSmallMarginBottom" visible="{= !${ui>/batchMode} }">
+						<Label text="{i18n>recordsPerEntityLabel}" labelFor="stepRecordsPerEntity"/>
+						<StepInput id="stepRecordsPerEntity" min="1" value="{ui>/recordsPerEntity}" width="10rem"/>
+					</VBox>
+					<MessageStrip
+						text="{ui>/statusText}"
+						type="{ui>/statusType}"
+						showIcon="true"
+						visible="{ui>/statusVisible}"
+						class="sapUiTinyMarginTop"
+					/>
+				</content>
+			</Panel>
+
+			<Panel headerText="{i18n>previewPanelTitle}" expandable="false">
+				<content>
+					<Toolbar>
+						<Title text="{i18n>previewPanelTitle}"/>
+						<ToolbarSpacer/>
+						<Text text="{ui>/fileNameText}" class="sapUiTinyMarginEnd"/>
+						<ObjectStatus text="{ui>/countText}"/>
+					</Toolbar>
+					<table:Table
+						id="employeesTable"
+						rows="{preview>/rows}"
+						selectionMode="None"
+						editable="false"
+						visibleRowCountMode="Fixed"
+						visibleRowCount="1"
+						columnHeaderHeight="34"
+						enableColumnReordering="false"
+					>
+						<table:noData>
+							<Text text="{i18n>noDataText}"/>
+						</table:noData>
+					</table:Table>
+				</content>
+			</Panel>
+		</content>
+	</Page>
+</mvc:View>

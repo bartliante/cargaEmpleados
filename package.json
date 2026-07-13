@@ -1,0 +1,16 @@
+{
+  "name": "CargaEmpleados",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@sap/cds": "^9"
+  },
+  "devDependencies": {
+    "@cap-js/sqlite": "1.4.0",
+    "@sap/cds-dk": "^9"
+  },
+  "scripts": {
+    "start": "cds-serve"
+  },
+  "private": true
+}
