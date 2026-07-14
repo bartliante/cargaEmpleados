@@ -20,6 +20,12 @@
 				</headerToolbar>
 				<content>
 					<VBox class="sapUiSmallMarginBottom">
+						<Label text="{i18n>connectionLabel}" labelFor="selectConnection"/>
+						<Select id="selectConnection" items="{/SFSFConnections}" selectedKey="{ui>/selectedConnection}" width="24rem">
+							<core:Item key="{Instancia_SFSF}" text="{NombreSistemaSFSF} ({Instancia_SFSF})"/>
+						</Select>
+					</VBox>
+					<VBox class="sapUiSmallMarginBottom">
 						<Label text="{i18n>fileUploaderLabel}" labelFor="fileUploader"/>
 						<unified:FileUploader
 							id="fileUploader"
@@ -59,18 +65,20 @@
 					<Toolbar>
 						<Title text="{i18n>previewPanelTitle}"/>
 						<ToolbarSpacer/>
-						<Text text="{ui>/fileNameText}" class="sapUiTinyMarginEnd"/>
+						<Button id="btnProcess" text="{i18n>btnProcess}" type="Emphasized" enabled="{= ${ui>/processEnabled} &amp;&amp; ${ui>/hasSelection} }" busy="{ui>/processing}" busyIndicatorDelay="0" press=".onProcess"/>
+						<Text text="{ui>/fileNameText}" class="sapUiTinyMarginEnd sapUiTinyMarginBegin"/>
 						<ObjectStatus text="{ui>/countText}"/>
 					</Toolbar>
 					<table:Table
 						id="employeesTable"
 						rows="{preview>/rows}"
-						selectionMode="None"
+						selectionMode="MultiToggle"
 						editable="false"
 						visibleRowCountMode="Fixed"
 						visibleRowCount="1"
 						columnHeaderHeight="34"
 						enableColumnReordering="false"
+						rowSelectionChange=".onRowSelectionChange"
 					>
 						<table:noData>
 							<Text text="{i18n>noDataText}"/>

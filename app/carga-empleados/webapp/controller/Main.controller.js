@@ -4,12 +4,24 @@ sap.ui.define([
 	"sap/ui/table/Column",
 	"sap/m/Label",
 	"sap/m/Text",
+	"sap/m/ObjectStatus",
 	"sap/m/MessageToast",
 	"cargaempleados/util/CSVParser"
-], function (Controller, JSONModel, Column, Label, Text, MessageToast, CSVParser) {
+], function (Controller, JSONModel, Column, Label, Text, ObjectStatus, MessageToast, CSVParser) {
 	"use strict";
 
 	var MAX_VISIBLE_ROWS = 20;
+
+	var STATUS = {
+		PENDING: "Pendiente",
+		OK: "OK",
+		ERROR: "ERROR"
+	};
+
+	var STATUS_META = {};
+	STATUS_META[STATUS.PENDING] = { icon: "sap-icon://alert", state: "Warning" };
+	STATUS_META[STATUS.OK] = { icon: "sap-icon://sys-enter-2", state: "Success" };
+	STATUS_META[STATUS.ERROR] = { icon: "sap-icon://error", state: "Error" };
 
 	return Controller.extend("cargaempleados.controller.Main", {
 
@@ -26,7 +38,11 @@ sap.ui.define([
 				countText: "",
 				batchMode: false,
 				purgeMode: false,
-				recordsPerEntity: 100
+				recordsPerEntity: 100,
+				selectedConnection: "",
+				processEnabled: false,
+				hasSelection: false,
+				processing: false
 			}), "ui");
 
 			this.getView().setModel(new JSONModel({
@@ -90,16 +106,104 @@ sap.ui.define([
 
 			var oTable = this.byId("employeesTable");
 			oTable.removeAllColumns();
+			oTable.clearSelection();
 			oTable.setVisibleRowCount(1);
 
 			this._setUi({
 				previewEnabled: false,
 				clearEnabled: false,
+				processEnabled: false,
+				hasSelection: false,
+				processing: false,
 				fileNameText: "",
 				countText: ""
 			});
 			this._setStatus("None", "", false);
 			this.byId("uploadPanel").setExpanded(true);
+		},
+
+		onRowSelectionChange: function () {
+			this._setUi({ hasSelection: this.byId("employeesTable").getSelectedIndices().length > 0 });
+		},
+
+		onProcess: function () {
+			var oPreviewModel = this.getView().getModel("preview");
+			var oPreviewData = oPreviewModel.getData();
+			var aRows = oPreviewData.rows;
+			var aHeaders = oPreviewData.headers;
+
+			if (!aRows || aRows.length === 0) {
+				this._setStatus("Warning", this._text("msgNoRowsToProcess"));
+				return;
+			}
+
+			var aSelectedIndices = this.byId("employeesTable").getSelectedIndices();
+			if (aSelectedIndices.length === 0) {
+				this._setStatus("Warning", this._text("msgNoRowsSelected"));
+				return;
+			}
+
+			var oUiModel = this.getView().getModel("ui");
+			var sConnection = oUiModel.getProperty("/selectedConnection");
+			if (!sConnection) {
+				this._setStatus("Warning", this._text("msgSelectConnection"));
+				return;
+			}
+
+			// The table binds cells by positional "colN" properties, but the
+			// backend needs the actual SFSF entity.field each column represents
+			// to be able to "cook" the record, so re-key every selected row by
+			// header. The original row index is kept so the result can be
+			// matched back to the right row once the backend responds.
+			var aPayloadRows = aSelectedIndices.map(function (iRowIndex) {
+				var oRow = aRows[iRowIndex];
+				var oFields = {};
+				aHeaders.forEach(function (sHeader, iCol) {
+					oFields[sHeader] = oRow["col" + iCol];
+				});
+				return { rowIndex: iRowIndex, fields: oFields };
+			});
+
+			this._setUi({ processing: true });
+			this._setStatus("None", "", false);
+
+			fetch("/odata/v4/carga-empleados/processRecords", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					connection: sConnection,
+					batchMode: oUiModel.getProperty("/batchMode"),
+					purgeMode: oUiModel.getProperty("/purgeMode"),
+					recordsPerEntity: oUiModel.getProperty("/recordsPerEntity"),
+					recordsJson: JSON.stringify(aPayloadRows)
+				})
+			}).then(function (oResponse) {
+				if (!oResponse.ok) {
+					throw new Error("HTTP " + oResponse.status);
+				}
+				return oResponse.json();
+			}).then(function (oResult) {
+				var aResults = oResult.value || oResult;
+				var iOk = 0;
+				var iError = 0;
+
+				aResults.forEach(function (oRowResult) {
+					oPreviewModel.setProperty("/rows/" + oRowResult.rowIndex + "/status", oRowResult.status);
+					oPreviewModel.setProperty("/rows/" + oRowResult.rowIndex + "/replicationError", oRowResult.replicationError || "");
+					if (oRowResult.status === STATUS.OK) {
+						iOk++;
+					} else {
+						iError++;
+					}
+				});
+
+				this._setUi({ processing: false });
+				this._setStatus(iError > 0 ? "Warning" : "Success", this._text("msgProcessResult", [iOk, iError]));
+				MessageToast.show(this._text("msgProcessResult", [iOk, iError]));
+			}.bind(this)).catch(function () {
+				this._setUi({ processing: false });
+				this._setStatus("Error", this._text("msgProcessError"));
+			}.bind(this));
 		},
 
 		_renderPreview: function (sCsvText) {
@@ -116,7 +220,7 @@ sap.ui.define([
 			}
 
 			var aRows = aRawRows.map(function (aCells) {
-				var oRow = {};
+				var oRow = { status: STATUS.PENDING, replicationError: "" };
 				aHeaders.forEach(function (sHeader, i) {
 					oRow["col" + i] = aCells[i] !== undefined ? aCells[i] : "";
 				});
@@ -129,10 +233,14 @@ sap.ui.define([
 			});
 
 			this._buildDynamicColumns(aHeaders);
-			this.byId("employeesTable").setVisibleRowCount(Math.min(Math.max(aRows.length, 1), MAX_VISIBLE_ROWS));
+			var oTable = this.byId("employeesTable");
+			oTable.clearSelection();
+			oTable.setVisibleRowCount(Math.min(Math.max(aRows.length, 1), MAX_VISIBLE_ROWS));
 
 			this._setUi({
 				clearEnabled: true,
+				processEnabled: aRows.length > 0,
+				hasSelection: false,
 				fileNameText: this._text("previewFileName", [this._oFile.name]),
 				countText: this._text("previewCount", [aRows.length])
 			});
@@ -186,6 +294,20 @@ sap.ui.define([
 			var oTable = this.byId("employeesTable");
 			oTable.removeAllColumns();
 
+			oTable.addColumn(new Column({
+				multiLabels: [
+					new Label({ text: "" }),
+					new Label({ text: this._text("statusColumnLabel") })
+				],
+				headerSpan: [1, 1],
+				template: new ObjectStatus({
+					text: "{preview>status}",
+					icon: { path: "preview>status", formatter: this._formatStatusIcon },
+					state: { path: "preview>status", formatter: this._formatStatusState }
+				}),
+				width: "9rem"
+			}));
+
 			var aGroups = this._groupHeadersByEntity(aHeaders);
 
 			aGroups.forEach(function (oGroup) {
@@ -205,6 +327,24 @@ sap.ui.define([
 					}));
 				});
 			});
+
+			oTable.addColumn(new Column({
+				multiLabels: [
+					new Label({ text: "" }),
+					new Label({ text: this._text("replicationErrorColumnLabel") })
+				],
+				headerSpan: [1, 1],
+				template: new Text({ text: "{preview>replicationError}" }),
+				width: "16rem"
+			}));
+		},
+
+		_formatStatusIcon: function (sStatus) {
+			return (STATUS_META[sStatus] || {}).icon || "";
+		},
+
+		_formatStatusState: function (sStatus) {
+			return (STATUS_META[sStatus] || {}).state || "None";
 		},
 
 		_setUi: function (oPartial) {
