@@ -76,6 +76,7 @@
 						editable="false"
 						visibleRowCountMode="Fixed"
 						visibleRowCount="1"
+						rowHeight="60"
 						columnHeaderHeight="34"
 						enableColumnReordering="false"
 						rowSelectionChange=".onRowSelectionChange"

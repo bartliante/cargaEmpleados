@@ -40,6 +40,16 @@ function escapeXml(vValue) {
 		.replace(/'/g, "&apos;");
 }
 
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/** A plain "yyyy-mm-dd" value is sent to SFSF as "yyyy-mm-ddT00:00:00". */
+function formatFieldValue(vValue) {
+	if (typeof vValue === "string" && DATE_ONLY_PATTERN.test(vValue)) {
+		return `${vValue}T00:00:00`;
+	}
+	return vValue;
+}
+
 /**
  * Builds the atom+xml <entry> for one entity's upsert. Every field
  * (including what would be a key field, e.g. userId/personIdExternal) is
@@ -47,7 +57,7 @@ function escapeXml(vValue) {
  */
 function buildEntityXml(sEntity, oEntityFields) {
 	const sProperties = Object.keys(oEntityFields)
-		.map((sField) => `      <d:${sField}>${escapeXml(oEntityFields[sField])}</d:${sField}>`)
+		.map((sField) => `      <d:${sField}>${escapeXml(formatFieldValue(oEntityFields[sField]))}</d:${sField}>`)
 		.join("\n");
 
 	return [
@@ -94,6 +104,8 @@ function groupRowsIntoBatches(aRows) {
  * Builds the multipart/mixed $batch body SFSF expects for batch execution:
  * a single outer "batch_<n>" wrapping one "changeset_<n>" changeset, with
  * one atom+xml "POST upsert" part per entity across all given records.
+ * Returns both the body text and the boundary, since the boundary is also
+ * needed for the Content-Type header when the batch is sent.
  */
 function buildBatchBody(aRows) {
 	iBatchCounter++;
@@ -130,11 +142,78 @@ function buildBatchBody(aRows) {
 
 	aLines.push(`--${sChangesetBoundary}--`, `--${sBatchBoundary}--`);
 
-	return aLines.join("\n");
+	return { boundary: sBatchBoundary, body: aLines.join("\n") };
+}
+
+/**
+ * Resolves Basic Auth credentials for a connection from environment
+ * variables named "<Credential_ALIAS>_USER" / "<Credential_ALIAS>_PASSWORD".
+ */
+function resolveCredentials(sCredentialAlias) {
+	const sUser = process.env[`${sCredentialAlias}_USER`];
+	const sPassword = process.env[`${sCredentialAlias}_PASSWORD`];
+
+	if (!sUser || !sPassword) {
+		return null;
+	}
+	return { user: sUser, password: sPassword };
+}
+
+/**
+ * POSTs one $batch document to SFSF and returns its outcome. A changeset is
+ * atomic, so a single success/failure applies to every row in the group.
+ */
+async function sendBatchToSfsf(sUrlApi, oCredentials, sBoundary, sBody) {
+	let oResponse;
+	try {
+		oResponse = await fetch(`${sUrlApi}/$batch`, {
+			method: "POST",
+			headers: {
+				"Content-Type": `multipart/mixed; boundary=${sBoundary}`,
+				Accept: "multipart/mixed",
+				Authorization: "Basic " + Buffer.from(`${oCredentials.user}:${oCredentials.password}`).toString("base64")
+			},
+			body: sBody
+		});
+	} catch (oNetworkError) {
+		return { success: false, errorMessage: `No se ha podido contactar con SFSF: ${oNetworkError.message}` };
+	}
+
+	const sResponseText = await oResponse.text();
+
+	if (!oResponse.ok) {
+		return { success: false, errorMessage: extractErrorMessage(sResponseText) || `SFSF respondió HTTP ${oResponse.status}` };
+	}
+
+	// A 2xx on the outer $batch call doesn't guarantee the changeset inside
+	// succeeded - look for the embedded HTTP status of the changeset itself.
+	const oInnerStatus = sResponseText.match(/HTTP\/1\.\d\s+(\d{3})/);
+	const iInnerStatus = oInnerStatus ? parseInt(oInnerStatus[1], 10) : oResponse.status;
+
+	if (iInnerStatus >= 300) {
+		return { success: false, errorMessage: extractErrorMessage(sResponseText) || `SFSF respondió HTTP ${iInnerStatus}` };
+	}
+
+	return { success: true, errorMessage: "" };
+}
+
+/** Best-effort extraction of a human-readable error out of an OData v2 error body (XML or JSON). */
+function extractErrorMessage(sResponseText) {
+	const oXmlMatch = sResponseText.match(/<message[^>]*>([\s\S]*?)<\/message>/);
+	if (oXmlMatch) {
+		return oXmlMatch[1].trim();
+	}
+
+	const oJsonMatch = sResponseText.match(/"message"\s*:\s*\{[^}]*"value"\s*:\s*"([^"]+)"/);
+	if (oJsonMatch) {
+		return oJsonMatch[1];
+	}
+
+	return "";
 }
 
 export default function () {
-	this.on("processRecords", (req) => {
+	this.on("processRecords", async (req) => {
 		const { connection, batchMode, purgeMode, recordsPerEntity, recordsJson } = req.data;
 
 		let aRows;
@@ -144,39 +223,61 @@ export default function () {
 			return req.error(400, "recordsJson no es un JSON válido");
 		}
 
-		if (batchMode) {
-			// Rows are grouped so that a row without User data travels in the
-			// same SFSF $batch as the preceding row that did have it, then one
-			// batch/changeset XML body is built per group.
-			const aBatches = groupRowsIntoBatches(aRows);
-			console.log(`processRecords: connection=${connection} batchMode=true rows=${aRows.length} batches=${aBatches.length}`);
-			aBatches.forEach((aBatchRows, i) => {
-				const sBatchBody = buildBatchBody(aBatchRows);
-				console.log(`--- batch ${i + 1}/${aBatches.length} (${aBatchRows.length} filas) ---\n${sBatchBody}`);
-			});
-		} else {
+		if (!batchMode) {
 			// Non-batch body shape (purge vs upsert) is still provisional
-			// until its real format is defined.
+			// until its real format is defined - keeps simulating for now.
 			console.log(
 				`processRecords: connection=${connection} batchMode=false purgeMode=${purgeMode} recordsPerEntity=${recordsPerEntity} rows=${aRows.length}`
 			);
+
+			return aRows.map((oRow, i) => {
+				const iRowIndex = oRow.rowIndex != null ? oRow.rowIndex : i;
+				const bFail = iRowIndex % 3 === 2;
+				const aEntities = Object.keys(groupFieldsByEntity(oRow.fields));
+
+				return {
+					rowIndex: iRowIndex,
+					status: bFail ? "ERROR" : "OK",
+					replicationError: bFail
+						? `Simulación: la instancia ${connection || "SFSF"} ha rechazado el registro con entidades [${aEntities.join(", ")}] (dato de ejemplo, sin conexión real todavía).`
+						: ""
+				};
+			});
 		}
 
-		// Simulated outcome: no real SFSF call yet, one out of every three
-		// records is reported as failed so the UI's OK/ERROR handling can be
-		// exercised end to end.
-		return aRows.map((oRow, i) => {
-			const iRowIndex = oRow.rowIndex != null ? oRow.rowIndex : i;
-			const bFail = iRowIndex % 3 === 2;
-			const aEntities = Object.keys(groupFieldsByEntity(oRow.fields));
+		const [oConnection] = await this.read("SFSFConnections").where({ Instancia_SFSF: connection });
+		if (!oConnection) {
+			return req.error(400, `No existe la conexión SFSF "${connection}"`);
+		}
 
-			return {
-				rowIndex: iRowIndex,
-				status: bFail ? "ERROR" : "OK",
-				replicationError: bFail
-					? `Simulación: la instancia ${connection || "SFSF"} ha rechazado el registro con entidades [${aEntities.join(", ")}] (dato de ejemplo, sin conexión real todavía).`
-					: ""
-			};
-		});
+		const oCredentials = resolveCredentials(oConnection.Credential_ALIAS);
+		if (!oCredentials) {
+			return req.error(
+				500,
+				`Faltan las variables de entorno ${oConnection.Credential_ALIAS}_USER / ${oConnection.Credential_ALIAS}_PASSWORD`
+			);
+		}
+
+		// Rows are grouped so that a row without User data travels in the same
+		// SFSF $batch as the preceding row that did have it. Each group is one
+		// atomic changeset, so its send outcome applies to all of its rows.
+		const aBatches = groupRowsIntoBatches(aRows);
+		const aResults = [];
+
+		for (const aBatchRows of aBatches) {
+			const { boundary, body } = buildBatchBody(aBatchRows);
+			const oOutcome = await sendBatchToSfsf(oConnection.URL_API, oCredentials, boundary, body);
+
+			aBatchRows.forEach((oRow, i) => {
+				const iRowIndex = oRow.rowIndex != null ? oRow.rowIndex : i;
+				aResults.push({
+					rowIndex: iRowIndex,
+					status: oOutcome.success ? "OK" : "ERROR",
+					replicationError: oOutcome.success ? "" : oOutcome.errorMessage
+				});
+			});
+		}
+
+		return aResults;
 	});
 }

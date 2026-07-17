@@ -1,4 +1,4 @@
 Instancia_SFSF,URL_API,Credential_ALIAS,NombreSistemaSFSF
-DEV,https://apisalesdemo2.successfactors.eu/odata/v2,SFSF_DEV_CRED,SuccessFactors Desarrollo
+airnostrumT1,https://api2preview.sapsf.eu/odata/v2,SFSF_T1_AIRN_CRED,SuccessFactors Test
 QA,https://apisalesdemo2.successfactors.eu/odata/v2,SFSF_QA_CRED,SuccessFactors Calidad
 PRD,https://api12.successfactors.eu/odata/v2,SFSF_PRD_CRED,SuccessFactors Producción

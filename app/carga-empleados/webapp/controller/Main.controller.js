@@ -334,8 +334,8 @@ sap.ui.define([
 					new Label({ text: this._text("replicationErrorColumnLabel") })
 				],
 				headerSpan: [1, 1],
-				template: new Text({ text: "{preview>replicationError}" }),
-				width: "16rem"
+				template: new Text({ text: "{preview>replicationError}", wrapping: true }),
+				width: "32rem"
 			}));
 		},
 

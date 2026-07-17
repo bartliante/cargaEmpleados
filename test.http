@@ -1,0 +1,28 @@
+@host = http://localhost:4004
+
+### List available SFSF connections
+GET {{host}}/odata/v4/carga-empleados/SFSFConnections
+
+### processRecords - batch mode (one row without User joins the previous one)
+POST {{host}}/odata/v4/carga-empleados/processRecords
+Content-Type: application/json
+
+{
+	"connection": "DEV",
+	"batchMode": true,
+	"purgeMode": false,
+	"recordsPerEntity": 100,
+	"recordsJson": "[{\"rowIndex\":0,\"fields\":{\"User.userId\":\"10045\",\"User.username\":\"jperez\",\"PerPerson.personIdExternal\":\"10045\",\"PerPerson.countryOfBirth\":\"ESP\"}},{\"rowIndex\":1,\"fields\":{\"User.userId\":\"\",\"PerAddressDEFLT.personIdExternal\":\"10045\",\"PerAddressDEFLT.addressType\":\"home\"}},{\"rowIndex\":2,\"fields\":{\"User.userId\":\"10099\",\"EmpJob.userId\":\"10099\"}}]"
+}
+
+### processRecords - non-batch mode (body shape still provisional)
+POST {{host}}/odata/v4/carga-empleados/processRecords
+Content-Type: application/json
+
+{
+	"connection": "DEV",
+	"batchMode": false,
+	"purgeMode": true,
+	"recordsPerEntity": 50,
+	"recordsJson": "[{\"rowIndex\":0,\"fields\":{\"User.userId\":\"10045\",\"PerPerson.personIdExternal\":\"10045\",\"PerPerson.countryOfBirth\":\"ESP\"}}]"
+}
