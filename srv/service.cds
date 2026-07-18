@@ -5,7 +5,10 @@ using cargaempleados as db from '../db/schema';
  * employee records and the actual OData push to SFSF are not implemented yet.
  */
 service CargaEmpleadosService {
-	@readonly entity SFSFConnections as projection on db.SFSFConnections;
+	// Usuario/Password are excluded: this entity is read by the frontend
+	// dropdown, and credentials must never reach the client. The backend
+	// reads them directly from the db entity (see srv/service.js).
+	@readonly entity SFSFConnections as projection on db.SFSFConnections excluding { Usuario, Password };
 
 	type ProcessResult {
 		rowIndex         : Integer;

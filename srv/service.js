@@ -1,3 +1,7 @@
+import cds from "@sap/cds";
+
+const { SELECT } = cds.ql;
+
 let iBatchCounter = 0;
 
 /**
@@ -75,25 +79,85 @@ function buildEntityXml(sEntity, oEntityFields) {
 	].join("\n");
 }
 
+/** Deterministic non-negative numeric hash of a string (djb2-style, 32-bit unsigned). */
+function numericHash(sInput) {
+	let iHash = 0;
+	for (let i = 0; i < sInput.length; i++) {
+		iHash = (iHash * 31 + sInput.charCodeAt(i)) >>> 0;
+	}
+	return iHash;
+}
+
 /**
- * Groups rows into batches: a row with User data starts a new group; rows
- * without User data are appended to the current group (the previous row
- * that did have User data), since they belong to the same employee. If the
- * very first row has no User data, it starts its own group since there is
- * no earlier group to attach it to.
+ * PaymentInformationDetailV3 needs a numeric externalCode. When the CSV
+ * doesn't provide one, it's derived from a hash of worker + effectiveStartDate
+ * + payType, so the same combination always yields the same externalCode.
+ */
+function ensurePaymentInformationExternalCode(oEntityFields) {
+	if (oEntityFields.externalCode !== undefined && oEntityFields.externalCode !== null && oEntityFields.externalCode !== "") {
+		return oEntityFields;
+	}
+
+	const sSeed = [
+		oEntityFields.PaymentInformationV3_worker || "",
+		oEntityFields.PaymentInformationV3_effectiveStartDate || "",
+		oEntityFields.payType || ""
+	].join("|");
+
+	return { ...oEntityFields, externalCode: numericHash(sSeed) };
+}
+
+const PRIMARY_GROUP_KEY_FIELDS = ["personIdExternal", "worker", "PaymentInformationV3_worker"];
+const FALLBACK_GROUP_KEY_FIELDS = ["userId"];
+
+/** Finds the value of the first "Entity.field" whose field part matches one of aFieldNames. */
+function findFieldValue(oFields, aFieldNames) {
+	for (const sHeader of Object.keys(oFields)) {
+		const iDot = sHeader.indexOf(".");
+		const sField = iDot === -1 ? sHeader : sHeader.substring(iDot + 1);
+		const vValue = oFields[sHeader];
+
+		if (aFieldNames.includes(sField) && vValue !== undefined && vValue !== null && vValue !== "") {
+			return vValue;
+		}
+	}
+	return null;
+}
+
+/**
+ * The employee identifier for a row: personIdExternal/worker/
+ * PaymentInformationV3_worker (whichever is present), falling back to
+ * userId. Returns null if none of them is present.
+ */
+function getGroupKey(oRow) {
+	const vPrimary = findFieldValue(oRow.fields, PRIMARY_GROUP_KEY_FIELDS);
+	return vPrimary !== null ? vPrimary : findFieldValue(oRow.fields, FALLBACK_GROUP_KEY_FIELDS);
+}
+
+/**
+ * Groups rows into batches by employee identifier: rows whose group key
+ * (see getGroupKey) matches go into the same batch, regardless of the order
+ * they appear in. A row with no identifiable key value gets its own group.
  */
 function groupRowsIntoBatches(aRows) {
 	const aBatches = [];
+	const oBatchByKey = {};
 
 	aRows.forEach((oRow) => {
-		const oByEntity = groupFieldsByEntity(oRow.fields);
-		const bHasUser = !!oByEntity.User && hasFirstFieldValue(oByEntity.User);
-		const aCurrentBatch = aBatches[aBatches.length - 1];
+		const vKey = getGroupKey(oRow);
 
-		if (bHasUser || !aCurrentBatch) {
+		if (vKey === null) {
 			aBatches.push([oRow]);
+			return;
+		}
+
+		const sKey = String(vKey);
+		if (oBatchByKey[sKey]) {
+			oBatchByKey[sKey].push(oRow);
 		} else {
-			aCurrentBatch.push(oRow);
+			const aNewBatch = [oRow];
+			oBatchByKey[sKey] = aNewBatch;
+			aBatches.push(aNewBatch);
 		}
 	});
 
@@ -125,6 +189,10 @@ function buildBatchBody(aRows) {
 				return;
 			}
 
+			const oEntityFields = sEntity === "PaymentInformationDetailV3"
+				? ensurePaymentInformationExternalCode(oByEntity[sEntity])
+				: oByEntity[sEntity];
+
 			aLines.push(
 				`--${sChangesetBoundary}`,
 				"Content-Type: application/http",
@@ -134,7 +202,7 @@ function buildBatchBody(aRows) {
 				"Content-Type: application/atom+xml",
 				"Accept: application/atom+xml",
 				"",
-				buildEntityXml(sEntity, oByEntity[sEntity]),
+				buildEntityXml(sEntity, oEntityFields),
 				""
 			);
 		});
@@ -143,20 +211,6 @@ function buildBatchBody(aRows) {
 	aLines.push(`--${sChangesetBoundary}--`, `--${sBatchBoundary}--`);
 
 	return { boundary: sBatchBoundary, body: aLines.join("\n") };
-}
-
-/**
- * Resolves Basic Auth credentials for a connection from environment
- * variables named "<Credential_ALIAS>_USER" / "<Credential_ALIAS>_PASSWORD".
- */
-function resolveCredentials(sCredentialAlias) {
-	const sUser = process.env[`${sCredentialAlias}_USER`];
-	const sPassword = process.env[`${sCredentialAlias}_PASSWORD`];
-
-	if (!sUser || !sPassword) {
-		return null;
-	}
-	return { user: sUser, password: sPassword };
 }
 
 /**
@@ -245,18 +299,18 @@ export default function () {
 			});
 		}
 
-		const [oConnection] = await this.read("SFSFConnections").where({ Instancia_SFSF: connection });
+		// Queries the raw db entity (not the service's SFSFConnections
+		// projection) since Usuario/Password are excluded from the latter
+		// so they never reach the frontend.
+		const [oConnection] = await SELECT.from("cargaempleados.SFSFConnections").where({ Instancia_SFSF: connection });
 		if (!oConnection) {
 			return req.error(400, `No existe la conexión SFSF "${connection}"`);
 		}
 
-		const oCredentials = resolveCredentials(oConnection.Credential_ALIAS);
-		if (!oCredentials) {
-			return req.error(
-				500,
-				`Faltan las variables de entorno ${oConnection.Credential_ALIAS}_USER / ${oConnection.Credential_ALIAS}_PASSWORD`
-			);
+		if (!oConnection.Usuario || !oConnection.Password) {
+			return req.error(500, `La conexión SFSF "${connection}" no tiene Usuario/Password configurados`);
 		}
+		const oCredentials = { user: oConnection.Usuario, password: oConnection.Password };
 
 		// Rows are grouped so that a row without User data travels in the same
 		// SFSF $batch as the preceding row that did have it. Each group is one
@@ -266,6 +320,10 @@ export default function () {
 
 		for (const aBatchRows of aBatches) {
 			const { boundary, body } = buildBatchBody(aBatchRows);
+			console.log(
+				`processRecords: enviando batch a SFSF (connection=${connection}, boundary=${boundary}, filas=${aBatchRows.length})\n${body}`
+			);
+
 			const oOutcome = await sendBatchToSfsf(oConnection.URL_API, oCredentials, boundary, body);
 
 			aBatchRows.forEach((oRow, i) => {
