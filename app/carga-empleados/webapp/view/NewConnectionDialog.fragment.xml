@@ -1,0 +1,27 @@
+<core:FragmentDefinition
+	xmlns="sap.m"
+	xmlns:core="sap.ui.core"
+>
+	<Dialog id="newConnectionDialog" title="{i18n>newConnectionDialogTitle}" contentWidth="28rem">
+		<content>
+			<VBox class="sapUiSmallMargin">
+				<Label text="{i18n>connInstanciaLabel}" labelFor="connInstancia" required="true"/>
+				<Input id="connInstancia" value="{newConn>/Instancia_SFSF}"/>
+				<Label text="{i18n>connUrlLabel}" labelFor="connUrl" class="sapUiSmallMarginTop"/>
+				<Input id="connUrl" value="{newConn>/URL_API}"/>
+				<Label text="{i18n>connNameLabel}" labelFor="connName" class="sapUiSmallMarginTop"/>
+				<Input id="connName" value="{newConn>/NombreSistemaSFSF}"/>
+				<Label text="{i18n>connUsuarioLabel}" labelFor="connUsuario" required="true" class="sapUiSmallMarginTop"/>
+				<Input id="connUsuario" value="{newConn>/Usuario}"/>
+				<Label text="{i18n>connPasswordLabel}" labelFor="connPassword" required="true" class="sapUiSmallMarginTop"/>
+				<Input id="connPassword" type="Password" value="{newConn>/Password}"/>
+			</VBox>
+		</content>
+		<beginButton>
+			<Button text="{i18n>btnSave}" type="Emphasized" busy="{newConn>/saving}" busyIndicatorDelay="0" press=".onSaveNewConnection"/>
+		</beginButton>
+		<endButton>
+			<Button text="{i18n>btnCancel}" press=".onCancelNewConnection"/>
+		</endButton>
+	</Dialog>
+</core:FragmentDefinition>

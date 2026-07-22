@@ -10,7 +10,8 @@
     "@sap/cds-dk": "^9"
   },
   "scripts": {
-    "start": "cds-serve"
+    "start": "cds-serve",
+    "watch": "cds watch --exclude db/data/cargaempleados-SFSFConnections.csv,.cdsrc-private.json"
   },
   "private": true
 }

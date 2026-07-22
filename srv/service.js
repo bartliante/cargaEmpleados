@@ -1,6 +1,193 @@
 import cds from "@sap/cds";
+import { existsSync, readFileSync, writeFileSync } from "fs";
+import { join } from "path";
 
-const { SELECT } = cds.ql;
+const CONNECTIONS_FILE = join(import.meta.dirname, "../db/data/cargaempleados-SFSFConnections.csv");
+const CONNECTIONS_COLUMNS = ["Instancia_SFSF", "URL_API", "Destination", "NombreSistemaSFSF"];
+const CDSRC_PRIVATE_FILE = join(import.meta.dirname, "../.cdsrc-private.json");
+
+// ---------------------------------------------------------------------
+// Local (no BTP) storage: connections catalog in a CSV file, destination
+// credentials in .cdsrc-private.json. Everything here is only used when
+// no real BTP destination service is bound (see getDestinationServiceCredentials).
+// ---------------------------------------------------------------------
+
+/**
+ * SFSFConnections isn't backed by a database - it's read from and appended
+ * to this plain CSV file, so no database is required to run the app.
+ */
+function readConnectionsFromFile() {
+	if (!existsSync(CONNECTIONS_FILE)) {
+		return [];
+	}
+
+	const aLines = readFileSync(CONNECTIONS_FILE, "utf8")
+		.split(/\r?\n/)
+		.filter((sLine) => sLine.trim().length > 0);
+
+	if (aLines.length === 0) {
+		return [];
+	}
+
+	const aHeaders = aLines[0].split(",").map((s) => s.trim());
+	return aLines.slice(1).map((sLine) => {
+		const aValues = sLine.split(",");
+		const oRow = {};
+		aHeaders.forEach((sHeader, i) => {
+			oRow[sHeader] = (aValues[i] || "").trim();
+		});
+		return oRow;
+	});
+}
+
+function appendConnectionToFile(oConnection) {
+	const aConnections = readConnectionsFromFile();
+	aConnections.push(oConnection);
+
+	const aLines = [CONNECTIONS_COLUMNS.join(",")];
+	aConnections.forEach((oRow) => {
+		aLines.push(CONNECTIONS_COLUMNS.map((sColumn) => oRow[sColumn] || "").join(","));
+	});
+	writeFileSync(CONNECTIONS_FILE, aLines.join("\n") + "\n", "utf8");
+}
+
+// In-memory overlay so a destination registered locally is usable
+// immediately, without waiting for a server restart to reload
+// .cdsrc-private.json into cds.env.
+const oRuntimeLocalDestinations = {};
+
+/** Best-effort persistence of a local destination's credentials for future restarts. */
+function persistLocalDestination(sDestinationAlias, sUsuario, sPassword) {
+	let oConfig = {};
+	if (existsSync(CDSRC_PRIVATE_FILE)) {
+		try {
+			oConfig = JSON.parse(readFileSync(CDSRC_PRIVATE_FILE, "utf8"));
+		} catch (e) {
+			oConfig = {};
+		}
+	}
+	oConfig.destinations = oConfig.destinations || {};
+	oConfig.destinations[sDestinationAlias] = { username: sUsuario, password: sPassword };
+	writeFileSync(CDSRC_PRIVATE_FILE, JSON.stringify(oConfig, null, "\t") + "\n", "utf8");
+}
+
+function registerLocalDestination(sDestinationAlias, sUsuario, sPassword) {
+	oRuntimeLocalDestinations[sDestinationAlias] = { username: sUsuario, password: sPassword };
+	persistLocalDestination(sDestinationAlias, sUsuario, sPassword);
+}
+
+// ---------------------------------------------------------------------
+// BTP Destination service (production): raw REST calls using the
+// credentials of a bound "destination" service instance. Not verified
+// against a real subaccount - this environment has no BTP connectivity.
+// ---------------------------------------------------------------------
+
+/** Returns the bound Destination service instance's credentials, or null if not bound (e.g. local dev). */
+function getDestinationServiceCredentials() {
+	if (!process.env.VCAP_SERVICES) {
+		return null;
+	}
+
+	let oVcapServices;
+	try {
+		oVcapServices = JSON.parse(process.env.VCAP_SERVICES);
+	} catch (e) {
+		return null;
+	}
+
+	const aInstances = oVcapServices.destination;
+	return aInstances && aInstances.length > 0 ? aInstances[0].credentials : null;
+}
+
+async function getDestinationServiceToken(oServiceCredentials) {
+	const oResponse = await fetch(`${oServiceCredentials.url}/oauth/token?grant_type=client_credentials`, {
+		method: "POST",
+		headers: {
+			Authorization: "Basic " + Buffer.from(`${oServiceCredentials.clientid}:${oServiceCredentials.clientsecret}`).toString("base64")
+		}
+	});
+	if (!oResponse.ok) {
+		throw new Error(`No se ha podido autenticar con el Destination Service (HTTP ${oResponse.status})`);
+	}
+	const oToken = await oResponse.json();
+	return oToken.access_token;
+}
+
+/** Lists subaccount destinations tagged as SFSF connections (custom "sfsfInstancia" property). */
+async function readConnectionsFromBtp(oServiceCredentials) {
+	const sToken = await getDestinationServiceToken(oServiceCredentials);
+	const oResponse = await fetch(`${oServiceCredentials.uri}/destination-configuration/v1/subaccountDestinations`, {
+		headers: { Authorization: `Bearer ${sToken}` }
+	});
+	if (!oResponse.ok) {
+		throw new Error(`No se han podido listar los Destinations de BTP (HTTP ${oResponse.status})`);
+	}
+
+	const aDestinations = await oResponse.json();
+	return aDestinations
+		.filter((oDestination) => oDestination.sfsfInstancia)
+		.map((oDestination) => ({
+			Instancia_SFSF: oDestination.sfsfInstancia,
+			URL_API: oDestination.URL || "",
+			Destination: oDestination.Name,
+			NombreSistemaSFSF: oDestination.sfsfSystemName || ""
+		}));
+}
+
+/** Creates a BasicAuthentication destination in BTP, tagged so it's picked up by readConnectionsFromBtp. */
+async function createBtpDestination(oServiceCredentials, sDestinationAlias, oConnection, sUsuario, sPassword) {
+	const sToken = await getDestinationServiceToken(oServiceCredentials);
+	const oResponse = await fetch(`${oServiceCredentials.uri}/destination-configuration/v1/subaccountDestinations`, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${sToken}`,
+			"Content-Type": "application/json"
+		},
+		body: JSON.stringify({
+			Name: sDestinationAlias,
+			Type: "HTTP",
+			URL: oConnection.URL_API,
+			Authentication: "BasicAuthentication",
+			ProxyType: "Internet",
+			User: sUsuario,
+			Password: sPassword,
+			sfsfInstancia: oConnection.Instancia_SFSF,
+			sfsfSystemName: oConnection.NombreSistemaSFSF || ""
+		})
+	});
+	if (!oResponse.ok) {
+		const sBody = await oResponse.text();
+		throw new Error(`No se ha podido crear el Destination en BTP (HTTP ${oResponse.status}): ${sBody}`);
+	}
+}
+
+/** Resolves a destination alias to its Basic Auth credentials, from BTP if bound, else from local config. */
+async function resolveDestinationCredentials(sDestinationAlias) {
+	const oServiceCredentials = getDestinationServiceCredentials();
+
+	if (oServiceCredentials) {
+		const sToken = await getDestinationServiceToken(oServiceCredentials);
+		const oResponse = await fetch(
+			`${oServiceCredentials.uri}/destination-configuration/v1/destinations/${encodeURIComponent(sDestinationAlias)}`,
+			{ headers: { Authorization: `Bearer ${sToken}` } }
+		);
+		if (!oResponse.ok) {
+			return null;
+		}
+		const oResolved = await oResponse.json();
+		const oDestination = oResolved.destinationConfiguration || oResolved;
+		if (!oDestination.User || !oDestination.Password) {
+			return null;
+		}
+		return { user: oDestination.User, password: oDestination.Password };
+	}
+
+	const oLocal = oRuntimeLocalDestinations[sDestinationAlias] || (cds.env.destinations || {})[sDestinationAlias];
+	if (!oLocal || !oLocal.username || !oLocal.password) {
+		return null;
+	}
+	return { user: oLocal.username, password: oLocal.password };
+}
 
 let iBatchCounter = 0;
 
@@ -267,6 +454,46 @@ function extractErrorMessage(sResponseText) {
 }
 
 export default function () {
+	this.on("READ", "SFSFConnections", async () => {
+		const oServiceCredentials = getDestinationServiceCredentials();
+		return oServiceCredentials ? readConnectionsFromBtp(oServiceCredentials) : readConnectionsFromFile();
+	});
+
+	this.on("registerConnection", async (req) => {
+		const { Instancia_SFSF, URL_API, NombreSistemaSFSF, Usuario, Password } = req.data;
+
+		if (!Instancia_SFSF || !Usuario || !Password) {
+			return req.error(400, "Instancia_SFSF, Usuario y Password son obligatorios");
+		}
+
+		const oServiceCredentials = getDestinationServiceCredentials();
+		const sDestinationAlias = `${Instancia_SFSF}-dest`;
+		const oConnection = { Instancia_SFSF, URL_API, NombreSistemaSFSF };
+
+		if (oServiceCredentials) {
+			await createBtpDestination(oServiceCredentials, sDestinationAlias, oConnection, Usuario, Password);
+		} else {
+			const aExisting = readConnectionsFromFile();
+			if (aExisting.some((oExisting) => oExisting.Instancia_SFSF === Instancia_SFSF)) {
+				return req.error(400, `Ya existe una conexión con Instancia_SFSF "${Instancia_SFSF}"`);
+			}
+			registerLocalDestination(sDestinationAlias, Usuario, Password);
+			appendConnectionToFile({
+				Instancia_SFSF,
+				URL_API: URL_API || "",
+				Destination: sDestinationAlias,
+				NombreSistemaSFSF: NombreSistemaSFSF || ""
+			});
+		}
+
+		return {
+			Instancia_SFSF,
+			URL_API: URL_API || "",
+			Destination: sDestinationAlias,
+			NombreSistemaSFSF: NombreSistemaSFSF || ""
+		};
+	});
+
 	this.on("processRecords", async (req) => {
 		const { connection, batchMode, purgeMode, recordsPerEntity, recordsJson } = req.data;
 
@@ -299,18 +526,24 @@ export default function () {
 			});
 		}
 
-		// Queries the raw db entity (not the service's SFSFConnections
-		// projection) since Usuario/Password are excluded from the latter
-		// so they never reach the frontend.
-		const [oConnection] = await SELECT.from("cargaempleados.SFSFConnections").where({ Instancia_SFSF: connection });
+		const oDestServiceCreds = getDestinationServiceCredentials();
+		const aConnections = oDestServiceCreds ? await readConnectionsFromBtp(oDestServiceCreds) : readConnectionsFromFile();
+		const oConnection = aConnections.find((c) => c.Instancia_SFSF === connection);
 		if (!oConnection) {
 			return req.error(400, `No existe la conexión SFSF "${connection}"`);
 		}
 
-		if (!oConnection.Usuario || !oConnection.Password) {
-			return req.error(500, `La conexión SFSF "${connection}" no tiene Usuario/Password configurados`);
+		if (!oConnection.Destination) {
+			return req.error(500, `La conexión SFSF "${connection}" no tiene Destination configurado`);
 		}
-		const oCredentials = { user: oConnection.Usuario, password: oConnection.Password };
+
+		const oCredentials = await resolveDestinationCredentials(oConnection.Destination);
+		if (!oCredentials) {
+			return req.error(
+				500,
+				`No se ha podido resolver el destino "${oConnection.Destination}" (revisa "destinations" en .cdsrc-private.json en local, o el Destination service en BTP)`
+			);
+		}
 
 		// Rows are grouped so that a row without User data travels in the same
 		// SFSF $batch as the preceding row that did have it. Each group is one

@@ -1,5 +1,6 @@
 sap.ui.define([
 	"sap/ui/core/mvc/Controller",
+	"sap/ui/core/Fragment",
 	"sap/ui/model/json/JSONModel",
 	"sap/ui/table/Column",
 	"sap/m/Label",
@@ -7,7 +8,7 @@ sap.ui.define([
 	"sap/m/ObjectStatus",
 	"sap/m/MessageToast",
 	"cargaempleados/util/CSVParser"
-], function (Controller, JSONModel, Column, Label, Text, ObjectStatus, MessageToast, CSVParser) {
+], function (Controller, Fragment, JSONModel, Column, Label, Text, ObjectStatus, MessageToast, CSVParser) {
 	"use strict";
 
 	var MAX_VISIBLE_ROWS = 20;
@@ -49,6 +50,78 @@ sap.ui.define([
 				headers: [],
 				rows: []
 			}), "preview");
+		},
+
+		onAddConnection: function () {
+			this.getView().setModel(new JSONModel({
+				Instancia_SFSF: "",
+				URL_API: "",
+				NombreSistemaSFSF: "",
+				Usuario: "",
+				Password: "",
+				saving: false
+			}), "newConn");
+
+			this._getNewConnectionDialog().then(function (oDialog) {
+				oDialog.open();
+			});
+		},
+
+		onCancelNewConnection: function () {
+			this.byId("newConnectionDialog").close();
+		},
+
+		onSaveNewConnection: function () {
+			var oNewConnModel = this.getView().getModel("newConn");
+			var oNewConn = oNewConnModel.getData();
+
+			if (!oNewConn.Instancia_SFSF || !oNewConn.Usuario || !oNewConn.Password) {
+				MessageToast.show(this._text("msgConnRequiredFields"));
+				return;
+			}
+
+			oNewConnModel.setProperty("/saving", true);
+
+			fetch("/odata/v4/carga-empleados/registerConnection", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					Instancia_SFSF: oNewConn.Instancia_SFSF,
+					URL_API: oNewConn.URL_API,
+					NombreSistemaSFSF: oNewConn.NombreSistemaSFSF,
+					Usuario: oNewConn.Usuario,
+					Password: oNewConn.Password
+				})
+			}).then(function (oResponse) {
+				if (!oResponse.ok) {
+					return oResponse.json().then(function (oErrorBody) {
+						throw new Error((oErrorBody.error && oErrorBody.error.message) || "HTTP " + oResponse.status);
+					});
+				}
+				return oResponse.json();
+			}).then(function () {
+				oNewConnModel.setProperty("/saving", false);
+				MessageToast.show(this._text("msgConnCreated"));
+				this.byId("selectConnection").getBinding("items").refresh();
+				this.byId("newConnectionDialog").close();
+			}.bind(this)).catch(function (oError) {
+				oNewConnModel.setProperty("/saving", false);
+				MessageToast.show(this._text("msgConnCreateError") + (oError && oError.message ? ": " + oError.message : ""));
+			}.bind(this));
+		},
+
+		_getNewConnectionDialog: function () {
+			if (!this._pNewConnectionDialog) {
+				this._pNewConnectionDialog = Fragment.load({
+					id: this.getView().getId(),
+					name: "cargaempleados.view.NewConnectionDialog",
+					controller: this
+				}).then(function (oDialog) {
+					this.getView().addDependent(oDialog);
+					return oDialog;
+				}.bind(this));
+			}
+			return this._pNewConnectionDialog;
 		},
 
 		onTypeMismatch: function () {

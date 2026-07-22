@@ -1,0 +1,4 @@
+Instancia_SFSF,URL_API,Destination,NombreSistemaSFSF
+airnostrumT1,https://api2preview.sapsf.eu/odata/v2,airnostrumT1-dest,SuccessFactors Test
+QA,https://apisalesdemo2.successfactors.eu/odata/v2,SFSF_QA_DEST,SuccessFactors Calidad
+PRD,https://api12.successfactors.eu/odata/v2,SFSF_PRD_DEST,SuccessFactors Producción

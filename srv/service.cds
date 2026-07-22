@@ -1,14 +1,40 @@
-using cargaempleados as db from '../db/schema';
-
 /**
  * Backend entities for the SFSF upload flow. Persistence for the loaded
- * employee records and the actual OData push to SFSF are not implemented yet.
+ * employee records is not implemented yet.
  */
 service CargaEmpleadosService {
-	// Usuario/Password are excluded: this entity is read by the frontend
-	// dropdown, and credentials must never reach the client. The backend
-	// reads them directly from the db entity (see srv/service.js).
-	@readonly entity SFSFConnections as projection on db.SFSFConnections excluding { Usuario, Password };
+	/**
+	 * Reference list of SuccessFactors instances/connections the user can
+	 * pick as the target for a CSV load. Not backed by a database - read
+	 * from and appended to a plain file (see srv/service.js), so no
+	 * database is required to run this app in production. Destination is
+	 * the alias of a BTP Destination service configuration (or, for local
+	 * development, an entry in .cdsrc-private.json) that resolves the real
+	 * SFSF auth - no credentials are stored here.
+	 */
+	entity SFSFConnections {
+		key Instancia_SFSF   : String(40);
+		    URL_API           : String(255);
+		    Destination       : String(100);
+		    NombreSistemaSFSF : String(100);
+	}
+
+	/**
+	 * Registers a new SFSF connection. Usuario/Password never get persisted
+	 * as-is or exposed back to the client: when bound to a real BTP
+	 * Destination service, they're used once to create the actual
+	 * Destination there; locally (no such binding), they're written to
+	 * .cdsrc-private.json's "destinations" map instead. Either way, only
+	 * the resulting Destination alias ends up on the returned/listed
+	 * SFSFConnections record.
+	 */
+	action registerConnection(
+		Instancia_SFSF    : String(40),
+		URL_API           : String(255),
+		NombreSistemaSFSF : String(100),
+		Usuario           : String(100),
+		Password          : String(100)
+	) returns SFSFConnections;
 
 	type ProcessResult {
 		rowIndex         : Integer;

@@ -21,9 +21,12 @@
 				<content>
 					<VBox class="sapUiSmallMarginBottom">
 						<Label text="{i18n>connectionLabel}" labelFor="selectConnection"/>
-						<Select id="selectConnection" items="{/SFSFConnections}" selectedKey="{ui>/selectedConnection}" width="24rem">
-							<core:Item key="{Instancia_SFSF}" text="{NombreSistemaSFSF} ({Instancia_SFSF})"/>
-						</Select>
+						<HBox>
+							<Select id="selectConnection" items="{/SFSFConnections}" selectedKey="{ui>/selectedConnection}" width="24rem">
+								<core:Item key="{Instancia_SFSF}" text="{NombreSistemaSFSF} ({Instancia_SFSF})"/>
+							</Select>
+							<Button icon="sap-icon://add" tooltip="{i18n>btnAddConnection}" press=".onAddConnection" class="sapUiTinyMarginBegin"/>
+						</HBox>
 					</VBox>
 					<VBox class="sapUiSmallMarginBottom">
 						<Label text="{i18n>fileUploaderLabel}" labelFor="fileUploader"/>
