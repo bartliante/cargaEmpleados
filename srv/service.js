@@ -400,6 +400,133 @@ function buildBatchBody(aRows) {
 	return { boundary: sBatchBoundary, body: aLines.join("\n") };
 }
 
+// ---------------------------------------------------------------------
+// Non-batch (batchMode = false) execution: unlike batch mode (grouped by
+// employee), records are grouped by SFSF entity type across all selected
+// rows, then each entity's records are chunked by recordsPerEntity - never
+// splitting a single employee's records for that entity across chunks.
+// ---------------------------------------------------------------------
+
+/**
+ * Groups every selected row's entity data by entity type (not by employee):
+ * one array per entity name, each record carrying the employee key it
+ * belongs to (for chunk boundaries and per-row result aggregation) and its
+ * original rowIndex.
+ */
+function groupRecordsByEntityType(aRows) {
+	const oByEntityType = {};
+
+	aRows.forEach((oRow, i) => {
+		const iRowIndex = oRow.rowIndex != null ? oRow.rowIndex : i;
+		const sEmployeeKey = String(getGroupKey(oRow) ?? `__row${iRowIndex}`);
+		const oByEntity = groupFieldsByEntity(oRow.fields);
+
+		Object.keys(oByEntity).forEach((sEntity) => {
+			if (!hasFirstFieldValue(oByEntity[sEntity])) {
+				return;
+			}
+
+			if (!oByEntityType[sEntity]) {
+				oByEntityType[sEntity] = [];
+			}
+			oByEntityType[sEntity].push({
+				rowIndex: iRowIndex,
+				employeeKey: sEmployeeKey,
+				fields: sEntity === "PaymentInformationDetailV3" ? ensurePaymentInformationExternalCode(oByEntity[sEntity]) : oByEntity[sEntity]
+			});
+		});
+	});
+
+	return oByEntityType;
+}
+
+/** Groups records by employeeKey, keeping each employee's records contiguous in first-appearance order. */
+function groupByEmployeeKeyPreservingOrder(aRecords) {
+	const oGroups = {};
+	const aOrder = [];
+
+	aRecords.forEach((oRecord) => {
+		if (!oGroups[oRecord.employeeKey]) {
+			oGroups[oRecord.employeeKey] = [];
+			aOrder.push(oRecord.employeeKey);
+		}
+		oGroups[oRecord.employeeKey].push(oRecord);
+	});
+
+	return aOrder.map((sKey) => oGroups[sKey]);
+}
+
+/**
+ * Splits an entity's records into chunks of ~iChunkSize records: whole
+ * employee-groups are added to the current chunk until it reaches
+ * iChunkSize, so a chunk can end up larger than iChunkSize when an
+ * employee's own records for that entity don't fit evenly.
+ */
+function chunkByEmployee(aRecords, iChunkSize) {
+	const aEmployeeGroups = groupByEmployeeKeyPreservingOrder(aRecords);
+	const aChunks = [];
+	let aCurrentChunk = [];
+
+	aEmployeeGroups.forEach((aEmployeeRecords) => {
+		aCurrentChunk.push(...aEmployeeRecords);
+		if (aCurrentChunk.length >= iChunkSize) {
+			aChunks.push(aCurrentChunk);
+			aCurrentChunk = [];
+		}
+	});
+
+	if (aCurrentChunk.length > 0) {
+		aChunks.push(aCurrentChunk);
+	}
+
+	return aChunks;
+}
+
+/**
+ * The "POST upsert ... HTTP/1.1" line for an entity: User gets
+ * processInactiveEmployees=true; every other entity gets purgeType=full
+ * when purge mode is on, or no query param at all otherwise.
+ */
+function buildUpsertLine(sEntity, bPurgeMode) {
+	if (sEntity === "User") {
+		return "POST upsert?processInactiveEmployees=true HTTP/1.1";
+	}
+	return bPurgeMode ? "POST upsert?purgeType=full HTTP/1.1" : "POST upsert HTTP/1.1";
+}
+
+/** Same multipart/changeset shape as buildBatchBody, but for one entity's chunk of records. */
+function buildEntityChunkBody(sEntity, aChunkRecords, bPurgeMode) {
+	iBatchCounter++;
+	const sBatchBoundary = `batch_${iBatchCounter}`;
+	const sChangesetBoundary = `changeset_${iBatchCounter}`;
+	const sUpsertLine = buildUpsertLine(sEntity, bPurgeMode);
+
+	const aLines = [
+		`--${sBatchBoundary}`,
+		`Content-Type: multipart/mixed; boundary=${sChangesetBoundary}`,
+		""
+	];
+
+	aChunkRecords.forEach((oRecord) => {
+		aLines.push(
+			`--${sChangesetBoundary}`,
+			"Content-Type: application/http",
+			"Content-Transfer-Encoding: binary",
+			"",
+			sUpsertLine,
+			"Content-Type: application/atom+xml",
+			"Accept: application/atom+xml",
+			"",
+			buildEntityXml(sEntity, oRecord.fields),
+			""
+		);
+	});
+
+	aLines.push(`--${sChangesetBoundary}--`, `--${sBatchBoundary}--`);
+
+	return { boundary: sBatchBoundary, body: aLines.join("\n") };
+}
+
 /**
  * POSTs one $batch document to SFSF and returns its outcome. A changeset is
  * atomic, so a single success/failure applies to every row in the group.
@@ -504,28 +631,6 @@ export default function () {
 			return req.error(400, "recordsJson no es un JSON válido");
 		}
 
-		if (!batchMode) {
-			// Non-batch body shape (purge vs upsert) is still provisional
-			// until its real format is defined - keeps simulating for now.
-			console.log(
-				`processRecords: connection=${connection} batchMode=false purgeMode=${purgeMode} recordsPerEntity=${recordsPerEntity} rows=${aRows.length}`
-			);
-
-			return aRows.map((oRow, i) => {
-				const iRowIndex = oRow.rowIndex != null ? oRow.rowIndex : i;
-				const bFail = iRowIndex % 3 === 2;
-				const aEntities = Object.keys(groupFieldsByEntity(oRow.fields));
-
-				return {
-					rowIndex: iRowIndex,
-					status: bFail ? "ERROR" : "OK",
-					replicationError: bFail
-						? `Simulación: la instancia ${connection || "SFSF"} ha rechazado el registro con entidades [${aEntities.join(", ")}] (dato de ejemplo, sin conexión real todavía).`
-						: ""
-				};
-			});
-		}
-
 		const oDestServiceCreds = getDestinationServiceCredentials();
 		const aConnections = oDestServiceCreds ? await readConnectionsFromBtp(oDestServiceCreds) : readConnectionsFromFile();
 		const oConnection = aConnections.find((c) => c.Instancia_SFSF === connection);
@@ -545,30 +650,80 @@ export default function () {
 			);
 		}
 
-		// Rows are grouped so that a row without User data travels in the same
-		// SFSF $batch as the preceding row that did have it. Each group is one
-		// atomic changeset, so its send outcome applies to all of its rows.
-		const aBatches = groupRowsIntoBatches(aRows);
-		const aResults = [];
+		if (batchMode) {
+			// Rows are grouped so that a row without User data travels in the same
+			// SFSF $batch as the preceding row that did have it. Each group is one
+			// atomic changeset, so its send outcome applies to all of its rows.
+			const aBatches = groupRowsIntoBatches(aRows);
+			const aResults = [];
 
-		for (const aBatchRows of aBatches) {
-			const { boundary, body } = buildBatchBody(aBatchRows);
-			console.log(
-				`processRecords: enviando batch a SFSF (connection=${connection}, boundary=${boundary}, filas=${aBatchRows.length})\n${body}`
-			);
+			for (const aBatchRows of aBatches) {
+				const { boundary, body } = buildBatchBody(aBatchRows);
+				console.log(
+					`processRecords: enviando batch a SFSF (connection=${connection}, boundary=${boundary}, filas=${aBatchRows.length})\n${body}`
+				);
 
-			const oOutcome = await sendBatchToSfsf(oConnection.URL_API, oCredentials, boundary, body);
+				const oOutcome = await sendBatchToSfsf(oConnection.URL_API, oCredentials, boundary, body);
 
-			aBatchRows.forEach((oRow, i) => {
-				const iRowIndex = oRow.rowIndex != null ? oRow.rowIndex : i;
-				aResults.push({
-					rowIndex: iRowIndex,
-					status: oOutcome.success ? "OK" : "ERROR",
-					replicationError: oOutcome.success ? "" : oOutcome.errorMessage
+				aBatchRows.forEach((oRow, i) => {
+					const iRowIndex = oRow.rowIndex != null ? oRow.rowIndex : i;
+					aResults.push({
+						rowIndex: iRowIndex,
+						status: oOutcome.success ? "OK" : "ERROR",
+						replicationError: oOutcome.success ? "" : oOutcome.errorMessage
+					});
 				});
-			});
+			}
+
+			return aResults;
 		}
 
-		return aResults;
+		// Non-batch: records are grouped by entity type (not by employee), then
+		// each entity's records are chunked by recordsPerEntity. An employee's
+		// overall result is OK only if every entity it contributed to succeeded.
+		const iChunkSize = Math.max(parseInt(recordsPerEntity, 10) || 1, 1);
+		const oByEntityType = groupRecordsByEntityType(aRows);
+		const oEntityOutcomeByEmployee = {}; // employeeKey -> { entityName: { success, errorMessage } }
+
+		for (const sEntity of Object.keys(oByEntityType)) {
+			const aChunks = chunkByEmployee(oByEntityType[sEntity], iChunkSize);
+
+			for (const aChunkRecords of aChunks) {
+				const { boundary, body } = buildEntityChunkBody(sEntity, aChunkRecords, purgeMode);
+				console.log(
+					`processRecords: enviando upsert de ${sEntity} a SFSF (connection=${connection}, boundary=${boundary}, registros=${aChunkRecords.length})\n${body}`
+				);
+
+				const oOutcome = await sendBatchToSfsf(oConnection.URL_API, oCredentials, boundary, body);
+
+				aChunkRecords.forEach((oRecord) => {
+					if (!oEntityOutcomeByEmployee[oRecord.employeeKey]) {
+						oEntityOutcomeByEmployee[oRecord.employeeKey] = {};
+					}
+					oEntityOutcomeByEmployee[oRecord.employeeKey][sEntity] = {
+						success: oOutcome.success,
+						errorMessage: oOutcome.errorMessage
+					};
+				});
+			}
+		}
+
+		return aRows.map((oRow, i) => {
+			const iRowIndex = oRow.rowIndex != null ? oRow.rowIndex : i;
+			const sEmployeeKey = String(getGroupKey(oRow) ?? `__row${iRowIndex}`);
+			const oByEntity = groupFieldsByEntity(oRow.fields);
+			const aRowEntities = Object.keys(oByEntity).filter((sEntity) => hasFirstFieldValue(oByEntity[sEntity]));
+			const oOutcomes = oEntityOutcomeByEmployee[sEmployeeKey] || {};
+
+			const aFailures = aRowEntities
+				.filter((sEntity) => oOutcomes[sEntity] && !oOutcomes[sEntity].success)
+				.map((sEntity) => `${sEntity}: ${oOutcomes[sEntity].errorMessage}`);
+
+			return {
+				rowIndex: iRowIndex,
+				status: aFailures.length > 0 ? "ERROR" : "OK",
+				replicationError: aFailures.join(" | ")
+			};
+		});
 	});
 }
