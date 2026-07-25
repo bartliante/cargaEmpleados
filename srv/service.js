@@ -494,37 +494,68 @@ function buildUpsertLine(sEntity, bPurgeMode) {
 	return bPurgeMode ? "POST upsert?purgeType=full HTTP/1.1" : "POST upsert HTTP/1.1";
 }
 
-/** Same multipart/changeset shape as buildBatchBody, but for one entity's chunk of records. */
+/**
+ * Splits a chunk's records into the units that become independent
+ * changesets. With purge mode on, one changeset per employee - their
+ * records for this entity succeed/fail together, matching purge's
+ * all-or-nothing replace semantics. Otherwise, one changeset per
+ * individual record, so one record's failure never rolls back another.
+ */
+function groupRecordsIntoChangesets(aChunkRecords, bPurgeMode) {
+	if (bPurgeMode) {
+		return groupByEmployeeKeyPreservingOrder(aChunkRecords);
+	}
+	return aChunkRecords.map((oRecord) => [oRecord]);
+}
+
+/**
+ * Same overall multipart shape as buildBatchBody, but for one entity's
+ * chunk of records, split into changesets by groupRecordsIntoChangesets.
+ * A changeset is atomic in OData v2, so bundling records into fewer,
+ * larger changesets means their outcomes ride together, while more/smaller
+ * changesets keep them independent.
+ * Also returns, per changeset and in order, the rowIndexes it covers, so
+ * the response (which preserves changeset order) can be matched back to
+ * the right rows - a changeset's outcome applies to all of its rowIndexes.
+ */
 function buildEntityChunkBody(sEntity, aChunkRecords, bPurgeMode) {
 	iBatchCounter++;
 	const sBatchBoundary = `batch_${iBatchCounter}`;
-	const sChangesetBoundary = `changeset_${iBatchCounter}`;
 	const sUpsertLine = buildUpsertLine(sEntity, bPurgeMode);
+	const aChangesetGroups = groupRecordsIntoChangesets(aChunkRecords, bPurgeMode);
 
-	const aLines = [
-		`--${sBatchBoundary}`,
-		`Content-Type: multipart/mixed; boundary=${sChangesetBoundary}`,
-		""
-	];
+	const aLines = [];
 
-	aChunkRecords.forEach((oRecord) => {
-		aLines.push(
-			`--${sChangesetBoundary}`,
-			"Content-Type: application/http",
-			"Content-Transfer-Encoding: binary",
-			"",
-			sUpsertLine,
-			"Content-Type: application/atom+xml",
-			"Accept: application/atom+xml",
-			"",
-			buildEntityXml(sEntity, oRecord.fields),
-			""
-		);
+	aChangesetGroups.forEach((aGroupRecords, i) => {
+		const sChangesetBoundary = `changeset_${iBatchCounter}_${i + 1}`;
+
+		aLines.push(`--${sBatchBoundary}`, `Content-Type: multipart/mixed; boundary=${sChangesetBoundary}`, "");
+
+		aGroupRecords.forEach((oRecord) => {
+			aLines.push(
+				`--${sChangesetBoundary}`,
+				"Content-Type: application/http",
+				"Content-Transfer-Encoding: binary",
+				"",
+				sUpsertLine,
+				"Content-Type: application/atom+xml",
+				"Accept: application/atom+xml",
+				"",
+				buildEntityXml(sEntity, oRecord.fields),
+				""
+			);
+		});
+
+		aLines.push(`--${sChangesetBoundary}--`);
 	});
 
-	aLines.push(`--${sChangesetBoundary}--`, `--${sBatchBoundary}--`);
+	aLines.push(`--${sBatchBoundary}--`);
 
-	return { boundary: sBatchBoundary, body: aLines.join("\n") };
+	return {
+		boundary: sBatchBoundary,
+		body: aLines.join("\n"),
+		changesetRowIndexes: aChangesetGroups.map((aGroupRecords) => aGroupRecords.map((oRecord) => oRecord.rowIndex))
+	};
 }
 
 /**
@@ -563,6 +594,95 @@ async function sendBatchToSfsf(sUrlApi, oCredentials, sBoundary, sBody) {
 	}
 
 	return { success: true, errorMessage: "" };
+}
+
+/** Boundary declared in a response's Content-Type header, if any. */
+function getResponseBoundary(oResponse) {
+	const sContentType = oResponse.headers.get("content-type") || "";
+	const oMatch = sContentType.match(/boundary=([^;]+)/);
+	return oMatch ? oMatch[1].trim().replace(/^"|"$/g, "") : null;
+}
+
+/** Splits a multipart body into its top-level parts (in order) using the given boundary. */
+function splitMultipartParts(sBody, sBoundary) {
+	return sBody
+		.split(`--${sBoundary}`)
+		.slice(1, -1)
+		.map((sPart) => sPart.trim())
+		.filter((sPart) => sPart.length > 0);
+}
+
+function parseEmbeddedHttpStatus(sPart) {
+	const oMatch = sPart.match(/HTTP\/1\.\d\s+(\d{3})/);
+	return oMatch ? parseInt(oMatch[1], 10) : null;
+}
+
+/**
+ * POSTs a $batch body built by buildEntityChunkBody and returns one outcome
+ * per rowIndex (expanding each changeset's outcome to every rowIndex it
+ * covers - see aChangesetRowIndexes), in the same order the changesets
+ * were sent. A successful changeset's response part is itself a nested
+ * multipart/mixed, while a failed one is a flat application/http part with
+ * the error, so counting top-level response parts lets each be matched
+ * back to its changeset by position.
+ */
+async function sendMultiChangesetToSfsf(sUrlApi, oCredentials, sBoundary, sBody, aChangesetRowIndexes) {
+	const expand = (fnOutcomeForChangeset) => {
+		const aResults = [];
+		aChangesetRowIndexes.forEach((aRowIndexes, iChangesetIndex) => {
+			const oOutcome = fnOutcomeForChangeset(iChangesetIndex);
+			aRowIndexes.forEach((iRowIndex) => {
+				aResults.push({ rowIndex: iRowIndex, success: oOutcome.success, errorMessage: oOutcome.errorMessage });
+			});
+		});
+		return aResults;
+	};
+
+	let oResponse;
+	try {
+		oResponse = await fetch(`${sUrlApi}/$batch`, {
+			method: "POST",
+			headers: {
+				"Content-Type": `multipart/mixed; boundary=${sBoundary}`,
+				Accept: "multipart/mixed",
+				Authorization: "Basic " + Buffer.from(`${oCredentials.user}:${oCredentials.password}`).toString("base64")
+			},
+			body: sBody
+		});
+	} catch (oNetworkError) {
+		const sMessage = `No se ha podido contactar con SFSF: ${oNetworkError.message}`;
+		return expand(() => ({ success: false, errorMessage: sMessage }));
+	}
+
+	const sResponseText = await oResponse.text();
+	console.log(`sendMultiChangesetToSfsf: HTTP ${oResponse.status}\n${sResponseText}`);
+
+	if (!oResponse.ok) {
+		const sMessage = extractErrorMessage(sResponseText) || `SFSF respondió HTTP ${oResponse.status}`;
+		return expand(() => ({ success: false, errorMessage: sMessage }));
+	}
+
+	const sResponseBoundary = getResponseBoundary(oResponse);
+	const aParts = sResponseBoundary ? splitMultipartParts(sResponseText, sResponseBoundary) : [];
+
+	if (aParts.length !== aChangesetRowIndexes.length) {
+		// Response shape didn't match what we expected - fall back to a single
+		// overall outcome for the whole chunk rather than guessing per changeset.
+		console.log(`sendMultiChangesetToSfsf: se esperaban ${aChangesetRowIndexes.length} partes y se encontraron ${aParts.length}`);
+		const iStatus = parseEmbeddedHttpStatus(sResponseText);
+		const bSuccess = iStatus !== null && iStatus < 300;
+		const sMessage = bSuccess ? "" : extractErrorMessage(sResponseText) || `SFSF respondió HTTP ${iStatus ?? oResponse.status}`;
+		return expand(() => ({ success: bSuccess, errorMessage: sMessage }));
+	}
+
+	return expand((i) => {
+		const iStatus = parseEmbeddedHttpStatus(aParts[i]);
+		const bSuccess = iStatus !== null && iStatus < 300;
+		return {
+			success: bSuccess,
+			errorMessage: bSuccess ? "" : extractErrorMessage(aParts[i]) || `SFSF respondió HTTP ${iStatus}`
+		};
+	});
 }
 
 /** Best-effort extraction of a human-readable error out of an OData v2 error body (XML or JSON). */
@@ -679,28 +799,33 @@ export default function () {
 		}
 
 		// Non-batch: records are grouped by entity type (not by employee), then
-		// each entity's records are chunked by recordsPerEntity. An employee's
-		// overall result is OK only if every entity it contributed to succeeded.
+		// each entity's records are chunked by recordsPerEntity (never
+		// splitting one employee's records for that entity across chunks -
+		// a chunk can end up bigger than recordsPerEntity because of this).
+		// Within a chunk, purge mode groups an employee's records into one
+		// changeset (succeed/fail together); otherwise each record gets its
+		// own changeset. A row's overall result is OK only if every entity it
+		// contributed to succeeded.
 		const iChunkSize = Math.max(parseInt(recordsPerEntity, 10) || 1, 1);
 		const oByEntityType = groupRecordsByEntityType(aRows);
-		const oEntityOutcomeByEmployee = {}; // employeeKey -> { entityName: { success, errorMessage } }
+		const oEntityOutcomeByRow = {}; // rowIndex -> { entityName: { success, errorMessage } }
 
 		for (const sEntity of Object.keys(oByEntityType)) {
 			const aChunks = chunkByEmployee(oByEntityType[sEntity], iChunkSize);
 
 			for (const aChunkRecords of aChunks) {
-				const { boundary, body } = buildEntityChunkBody(sEntity, aChunkRecords, purgeMode);
+				const { boundary, body, changesetRowIndexes } = buildEntityChunkBody(sEntity, aChunkRecords, purgeMode);
 				console.log(
-					`processRecords: enviando upsert de ${sEntity} a SFSF (connection=${connection}, boundary=${boundary}, registros=${aChunkRecords.length})\n${body}`
+					`processRecords: enviando upsert de ${sEntity} a SFSF (connection=${connection}, boundary=${boundary}, changesets=${changesetRowIndexes.length})\n${body}`
 				);
 
-				const oOutcome = await sendBatchToSfsf(oConnection.URL_API, oCredentials, boundary, body);
+				const aOutcomes = await sendMultiChangesetToSfsf(oConnection.URL_API, oCredentials, boundary, body, changesetRowIndexes);
 
-				aChunkRecords.forEach((oRecord) => {
-					if (!oEntityOutcomeByEmployee[oRecord.employeeKey]) {
-						oEntityOutcomeByEmployee[oRecord.employeeKey] = {};
+				aOutcomes.forEach((oOutcome) => {
+					if (!oEntityOutcomeByRow[oOutcome.rowIndex]) {
+						oEntityOutcomeByRow[oOutcome.rowIndex] = {};
 					}
-					oEntityOutcomeByEmployee[oRecord.employeeKey][sEntity] = {
+					oEntityOutcomeByRow[oOutcome.rowIndex][sEntity] = {
 						success: oOutcome.success,
 						errorMessage: oOutcome.errorMessage
 					};
@@ -710,10 +835,9 @@ export default function () {
 
 		return aRows.map((oRow, i) => {
 			const iRowIndex = oRow.rowIndex != null ? oRow.rowIndex : i;
-			const sEmployeeKey = String(getGroupKey(oRow) ?? `__row${iRowIndex}`);
 			const oByEntity = groupFieldsByEntity(oRow.fields);
 			const aRowEntities = Object.keys(oByEntity).filter((sEntity) => hasFirstFieldValue(oByEntity[sEntity]));
-			const oOutcomes = oEntityOutcomeByEmployee[sEmployeeKey] || {};
+			const oOutcomes = oEntityOutcomeByRow[iRowIndex] || {};
 
 			const aFailures = aRowEntities
 				.filter((sEntity) => oOutcomes[sEntity] && !oOutcomes[sEntity].success)
