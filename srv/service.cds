@@ -56,4 +56,16 @@ service CargaEmpleadosService {
 		recordsPerEntity : Integer,
 		recordsJson      : LargeString
 	) returns array of ProcessResult;
+
+	/**
+	 * Takes one failed row's field values (as JSON, same shape as a
+	 * processRecords row's "fields") and its replicationError, and asks an AI
+	 * model to explain the likely cause and how to fix it. Read-only - does
+	 * not touch SFSF or change the record's status.
+	 */
+	action analyzeErrorWithAI(
+		connection       : String,
+		fieldsJson       : LargeString,
+		replicationError : LargeString
+	) returns { analysis : LargeString };
 }

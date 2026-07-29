@@ -189,6 +189,36 @@ async function resolveDestinationCredentials(sDestinationAlias) {
 	return { user: oLocal.username, password: oLocal.password };
 }
 
+class HttpError extends Error {
+	constructor(iStatus, sMessage) {
+		super(sMessage);
+		this.status = iStatus;
+	}
+}
+
+/** Resolves a connection alias to its SFSFConnections row + Basic Auth credentials, or throws an HttpError. */
+async function resolveConnectionAndCredentials(sConnection) {
+	const oDestServiceCreds = getDestinationServiceCredentials();
+	const aConnections = oDestServiceCreds ? await readConnectionsFromBtp(oDestServiceCreds) : readConnectionsFromFile();
+	const oConnection = aConnections.find((c) => c.Instancia_SFSF === sConnection);
+	if (!oConnection) {
+		throw new HttpError(400, `No existe la conexión SFSF "${sConnection}"`);
+	}
+	if (!oConnection.Destination) {
+		throw new HttpError(500, `La conexión SFSF "${sConnection}" no tiene Destination configurado`);
+	}
+
+	const oCredentials = await resolveDestinationCredentials(oConnection.Destination);
+	if (!oCredentials) {
+		throw new HttpError(
+			500,
+			`No se ha podido resolver el destino "${oConnection.Destination}" (revisa "destinations" en .cdsrc-private.json en local, o el Destination service en BTP)`
+		);
+	}
+
+	return { oConnection, oCredentials };
+}
+
 let iBatchCounter = 0;
 
 /**
@@ -700,6 +730,320 @@ function extractErrorMessage(sResponseText) {
 	return "";
 }
 
+// ---------------------------------------------------------------------
+// SFSF $metadata inspection, for enriching the AI error analysis: given a
+// failing entity/field, tells whether it's a picklist (sap:picklist
+// attribute on the <Property>) or a navigation to another object (a sibling
+// <NavigationProperty Name="{field}Nav"> whose Association points to a real
+// entity, not a picklist option). Regex-based like the rest of this file's
+// XML handling (extractErrorMessage) - $metadata is tens of MB, too big to
+// justify pulling in a full XML parser dependency for this.
+// ---------------------------------------------------------------------
+
+const oMetadataCache = new Map(); // URL_API -> raw $metadata XML text, cached for the process lifetime
+
+/** Fetches (and caches) the raw OData v2 $metadata document for a connection. */
+async function fetchSfsfMetadata(sUrlApi, oCredentials) {
+	if (oMetadataCache.has(sUrlApi)) {
+		return oMetadataCache.get(sUrlApi);
+	}
+
+	const oResponse = await fetch(`${sUrlApi}/$metadata`, {
+		headers: { Authorization: "Basic " + Buffer.from(`${oCredentials.user}:${oCredentials.password}`).toString("base64") }
+	});
+	if (!oResponse.ok) {
+		throw new Error(`SFSF respondió HTTP ${oResponse.status} al consultar $metadata`);
+	}
+
+	const sMetadata = await oResponse.text();
+	oMetadataCache.set(sUrlApi, sMetadata);
+	return sMetadata;
+}
+
+function extractXmlAttr(sTag, sAttr) {
+	const oMatch = sTag.match(new RegExp(`${sAttr}="([^"]*)"`));
+	return oMatch ? oMatch[1] : null;
+}
+
+/** Strips a "Namespace.Name" qualifier down to just "Name" (associations/types are always namespace-qualified in $metadata). */
+function stripNamespace(sQualifiedName) {
+	const iDot = sQualifiedName.lastIndexOf(".");
+	return iDot === -1 ? sQualifiedName : sQualifiedName.substring(iDot + 1);
+}
+
+function findEntityTypeBlock(sMetadata, sEntityName) {
+	const oMatch = sMetadata.match(new RegExp(`<EntityType Name="${sEntityName}"[^>]*>[\\s\\S]*?</EntityType>`));
+	return oMatch ? oMatch[0] : null;
+}
+
+function findPropertyTag(sEntityTypeBlock, sFieldName) {
+	const oMatch = sEntityTypeBlock.match(new RegExp(`<Property Name="${sFieldName}"[^>]*>`));
+	return oMatch ? oMatch[0] : null;
+}
+
+function findNavigationTag(sEntityTypeBlock, sNavName) {
+	const oMatch = sEntityTypeBlock.match(new RegExp(`<NavigationProperty Name="${sNavName}"[^>]*>`));
+	return oMatch ? oMatch[0] : null;
+}
+
+function findEntityKeyProperties(sEntityTypeBlock) {
+	const oKeyMatch = sEntityTypeBlock.match(/<Key>([\s\S]*?)<\/Key>/);
+	if (!oKeyMatch) {
+		return [];
+	}
+	const aRefs = oKeyMatch[1].match(/<PropertyRef Name="([^"]+)"/g) || [];
+	return aRefs.map((sRef) => sRef.match(/Name="([^"]+)"/)[1]);
+}
+
+function findAssociationTargetEntity(sMetadata, sRelationship, sToRole) {
+	const sAssociationName = stripNamespace(sRelationship);
+	const oAssocMatch = sMetadata.match(new RegExp(`<Association Name="${sAssociationName}"[^>]*>[\\s\\S]*?</Association>`));
+	if (!oAssocMatch) {
+		return null;
+	}
+
+	const aEnds = oAssocMatch[0].match(/<End[^>]*>/g) || [];
+	const sEndTag = aEnds.find((sEnd) => extractXmlAttr(sEnd, "Role") === sToRole);
+	const sType = sEndTag && extractXmlAttr(sEndTag, "Type");
+	return sType ? stripNamespace(sType) : null;
+}
+
+/**
+ * Classifies one entity's field from $metadata: "picklist" (with its
+ * picklistId) if the <Property> carries sap:picklist, "navigation" (with the
+ * related entity name and its key properties) if there's a "{field}Nav"
+ * NavigationProperty pointing to a real entity (not a picklist option), or
+ * null if neither applies.
+ */
+function classifyField(sMetadata, sEntityName, sFieldName) {
+	const sEntityBlock = findEntityTypeBlock(sMetadata, sEntityName);
+	if (!sEntityBlock) {
+		return null;
+	}
+
+	const sPropertyTag = findPropertyTag(sEntityBlock, sFieldName);
+	const sPicklistId = sPropertyTag && extractXmlAttr(sPropertyTag, "sap:picklist");
+	if (sPicklistId) {
+		return { type: "picklist", picklistId: sPicklistId };
+	}
+
+	const sNavTag = findNavigationTag(sEntityBlock, `${sFieldName}Nav`);
+	if (!sNavTag) {
+		return null;
+	}
+
+	const sToRole = extractXmlAttr(sNavTag, "ToRole");
+	const sRelationship = extractXmlAttr(sNavTag, "Relationship");
+	if (!sToRole || !sRelationship || sToRole === "picklistoption") {
+		return null;
+	}
+
+	const sTargetEntity = findAssociationTargetEntity(sMetadata, sRelationship, sToRole);
+	if (!sTargetEntity) {
+		return null;
+	}
+
+	const sTargetEntityBlock = findEntityTypeBlock(sMetadata, sTargetEntity);
+	const aKeyProperties = sTargetEntityBlock ? findEntityKeyProperties(sTargetEntityBlock) : [];
+
+	return { type: "navigation", targetEntity: sTargetEntity, keyProperties: aKeyProperties };
+}
+
+/** Queries the configured values of a picklist, so the user can see valid options without opening SFSF. */
+async function fetchPicklistOptions(sUrlApi, oCredentials, sPicklistId) {
+	const sUrl = `${sUrlApi}/Picklist('${encodeURIComponent(sPicklistId)}')/picklistOptions?$select=id,externalCode,localeLabel,status&$format=json`;
+	const oResponse = await fetch(sUrl, {
+		headers: { Authorization: "Basic " + Buffer.from(`${oCredentials.user}:${oCredentials.password}`).toString("base64") }
+	});
+	if (!oResponse.ok) {
+		return null;
+	}
+	const oBody = await oResponse.json();
+	return (oBody.d?.results || []).map((oOption) => ({
+		optionId: oOption.id,
+		externalCode: oOption.externalCode,
+		label: oOption.localeLabel,
+		status: oOption.status
+	}));
+}
+
+/** Queries the related object a navigation field points to, by filtering on its first key property. */
+async function fetchNavigationTarget(sUrlApi, oCredentials, sTargetEntity, aKeyProperties, vValue) {
+	if (aKeyProperties.length === 0 || vValue === undefined || vValue === null || vValue === "") {
+		return null;
+	}
+
+	const sKeyProperty = aKeyProperties[0];
+	const sFilterValue = String(vValue).replace(/'/g, "''");
+	const sUrl = `${sUrlApi}/${sTargetEntity}?$filter=${encodeURIComponent(`${sKeyProperty} eq '${sFilterValue}'`)}&$format=json&$top=5`;
+
+	const oResponse = await fetch(sUrl, {
+		headers: { Authorization: "Basic " + Buffer.from(`${oCredentials.user}:${oCredentials.password}`).toString("base64") }
+	});
+	if (!oResponse.ok) {
+		return null;
+	}
+	const oBody = await oResponse.json();
+	return (oBody.d?.results || []).map(({ __metadata, ...oRest }) => oRest);
+}
+
+/**
+ * Non-batch mode's replicationError is "Entity1: msg1 | Entity2: msg2" (see
+ * processRecords), so the failing entity name(s) can be read straight off
+ * it. Batch mode's error has no such attribution (one message for the whole
+ * changeset) - returns [] in that case, and the caller falls back to
+ * enriching every entity present in the row instead of guessing.
+ */
+function parseFailedEntityNames(sReplicationError) {
+	const aEntities = [];
+	(sReplicationError || "").split(" | ").forEach((sSegment) => {
+		const oMatch = sSegment.match(/^(\w+):\s/);
+		if (oMatch) {
+			aEntities.push(oMatch[1]);
+		}
+	});
+	return aEntities;
+}
+
+/**
+ * Best-effort enrichment of a failed row's picklist/navigation fields from
+ * SFSF's live $metadata and data, for the entities implicated by
+ * replicationError (or every entity in the row, if that couldn't be
+ * determined - see parseFailedEntityNames). Never throws - any SFSF call
+ * failing here just means less context for the AI, not a failed analysis.
+ */
+async function buildFieldEnrichment(sUrlApi, oCredentials, oFields, sReplicationError) {
+	const oByEntity = groupFieldsByEntity(oFields);
+	const aFailedEntities = parseFailedEntityNames(sReplicationError);
+	const aEntitiesToInspect = aFailedEntities.length > 0 ? aFailedEntities : Object.keys(oByEntity);
+
+	let sMetadata;
+	try {
+		sMetadata = await fetchSfsfMetadata(sUrlApi, oCredentials);
+	} catch (oError) {
+		console.log(`buildFieldEnrichment: no se ha podido obtener $metadata: ${oError.message}`);
+		return {};
+	}
+
+	const oEnrichment = {};
+
+	for (const sEntity of aEntitiesToInspect) {
+		const oEntityFields = oByEntity[sEntity];
+		if (!oEntityFields) {
+			continue;
+		}
+
+		for (const sField of Object.keys(oEntityFields)) {
+			let oClassification;
+			try {
+				oClassification = classifyField(sMetadata, sEntity, sField);
+			} catch (oError) {
+				continue;
+			}
+			if (!oClassification) {
+				continue;
+			}
+
+			try {
+				if (oClassification.type === "picklist") {
+					const aOptions = await fetchPicklistOptions(sUrlApi, oCredentials, oClassification.picklistId);
+					if (aOptions) {
+						oEnrichment[`${sEntity}.${sField}`] = { type: "picklist", picklistId: oClassification.picklistId, valoresConfigurados: aOptions };
+					}
+				} else if (oClassification.type === "navigation") {
+					const aMatches = await fetchNavigationTarget(
+						sUrlApi,
+						oCredentials,
+						oClassification.targetEntity,
+						oClassification.keyProperties,
+						oEntityFields[sField]
+					);
+					if (aMatches) {
+						oEnrichment[`${sEntity}.${sField}`] = {
+							type: "navigation",
+							targetEntity: oClassification.targetEntity,
+							valorBuscado: oEntityFields[sField],
+							coincidencias: aMatches
+						};
+					}
+				}
+			} catch (oError) {
+				console.log(`buildFieldEnrichment: fallo consultando ${sEntity}.${sField}: ${oError.message}`);
+			}
+		}
+	}
+
+	return oEnrichment;
+}
+
+const GEMINI_MODEL = "gemini-flash-latest";
+
+/** Asks Gemini to explain an SFSF replication error and how to fix it, given the record's field values. */
+async function analyzeErrorWithGemini(oFields, sReplicationError, oEnrichment) {
+	const sApiKey = process.env.GEMINI_API_KEY;
+	if (!sApiKey) {
+		throw new Error("No se ha configurado GEMINI_API_KEY");
+	}
+
+	const aPromptLines = [
+		"Eres un experto en SAP SuccessFactors (SFSF) y en la carga de datos de empleados vía OData.",
+		"Se ha producido un error al replicar el siguiente registro hacia SFSF.",
+		"",
+		"Datos del registro (campo SFSF -> valor):",
+		JSON.stringify(oFields, null, 2),
+		"",
+		"Mensaje de error devuelto por SFSF:",
+		sReplicationError || "(sin mensaje de error)"
+	];
+
+	if (oEnrichment && Object.keys(oEnrichment).length > 0) {
+		aPromptLines.push(
+			"",
+			"Información adicional consultada en tiempo real sobre los campos de tipo picklist o navegación de este registro",
+			"(picklistId/valoresConfigurados = valores válidos configurados en SFSF para ese picklist;",
+			"coincidencias = registros de la entidad relacionada cuyo identificador coincide con el valor enviado, vacío si no hay ninguno):",
+			JSON.stringify(oEnrichment, null, 2)
+		);
+	}
+
+	aPromptLines.push(
+		"",
+		"Explica en español, de forma breve y clara, la causa más probable del error y los pasos concretos que debe seguir el usuario para corregirlo antes de reintentar la carga.",
+		"Si la información adicional anterior incluye valores configurados o coincidencias relevantes, apóyate en ellos (por ejemplo, indicando el valor correcto a usar) en lugar de dar una respuesta genérica.",
+		"Al listar valores de un picklist, indica siempre para cada uno sus tres datos - optionId, externalCode y label -, no solo externalCode y label: el usuario los necesita para no tener que consultarlos manualmente en SFSF."
+	);
+
+	const sPrompt = aPromptLines.join("\n");
+
+	let oResponse;
+	try {
+		oResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-goog-api-key": sApiKey
+			},
+			body: JSON.stringify({ contents: [{ parts: [{ text: sPrompt }] }] })
+		});
+	} catch (oNetworkError) {
+		throw new Error(`No se ha podido contactar con Gemini: ${oNetworkError.message}`);
+	}
+
+	if (!oResponse.ok) {
+		const sBody = await oResponse.text();
+		throw new Error(`Gemini respondió HTTP ${oResponse.status}: ${sBody}`);
+	}
+
+	const oResult = await oResponse.json();
+	const aParts = oResult.candidates?.[0]?.content?.parts || [];
+	const sText = aParts.map((oPart) => oPart.text || "").join("");
+
+	if (!sText) {
+		throw new Error("Gemini no ha devuelto ningún análisis");
+	}
+	return sText;
+}
+
 export default function () {
 	this.on("READ", "SFSFConnections", async () => {
 		const oServiceCredentials = getDestinationServiceCredentials();
@@ -751,23 +1095,11 @@ export default function () {
 			return req.error(400, "recordsJson no es un JSON válido");
 		}
 
-		const oDestServiceCreds = getDestinationServiceCredentials();
-		const aConnections = oDestServiceCreds ? await readConnectionsFromBtp(oDestServiceCreds) : readConnectionsFromFile();
-		const oConnection = aConnections.find((c) => c.Instancia_SFSF === connection);
-		if (!oConnection) {
-			return req.error(400, `No existe la conexión SFSF "${connection}"`);
-		}
-
-		if (!oConnection.Destination) {
-			return req.error(500, `La conexión SFSF "${connection}" no tiene Destination configurado`);
-		}
-
-		const oCredentials = await resolveDestinationCredentials(oConnection.Destination);
-		if (!oCredentials) {
-			return req.error(
-				500,
-				`No se ha podido resolver el destino "${oConnection.Destination}" (revisa "destinations" en .cdsrc-private.json en local, o el Destination service en BTP)`
-			);
+		let oConnection, oCredentials;
+		try {
+			({ oConnection, oCredentials } = await resolveConnectionAndCredentials(connection));
+		} catch (oError) {
+			return req.error(oError.status || 500, oError.message);
 		}
 
 		if (batchMode) {
@@ -849,5 +1181,33 @@ export default function () {
 				replicationError: aFailures.join(" | ")
 			};
 		});
+	});
+
+	this.on("analyzeErrorWithAI", async (req) => {
+		const { connection, fieldsJson, replicationError } = req.data;
+
+		let oFields;
+		try {
+			oFields = JSON.parse(fieldsJson || "{}");
+		} catch (e) {
+			return req.error(400, "fieldsJson no es un JSON válido");
+		}
+
+		let oEnrichment = {};
+		try {
+			const { oConnection, oCredentials } = await resolveConnectionAndCredentials(connection);
+			oEnrichment = await buildFieldEnrichment(oConnection.URL_API, oCredentials, oFields, replicationError);
+		} catch (oError) {
+			// Best-effort: if we can't resolve the connection or reach SFSF for
+			// enrichment, still fall back to a plain AI-only analysis below.
+			console.log(`analyzeErrorWithAI: no se ha podido enriquecer con datos de SFSF: ${oError.message}`);
+		}
+
+		try {
+			const sAnalysis = await analyzeErrorWithGemini(oFields, replicationError, oEnrichment);
+			return { analysis: sAnalysis };
+		} catch (oError) {
+			return req.error(500, `No se ha podido analizar el error con IA: ${oError.message}`);
+		}
 	});
 }

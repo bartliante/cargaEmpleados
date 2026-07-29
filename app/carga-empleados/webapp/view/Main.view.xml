@@ -69,6 +69,7 @@
 						<Title text="{i18n>previewPanelTitle}"/>
 						<ToolbarSpacer/>
 						<Button id="btnProcess" text="{i18n>btnProcess}" type="Emphasized" enabled="{= ${ui>/processEnabled} &amp;&amp; ${ui>/hasSelection} }" busy="{ui>/processing}" busyIndicatorDelay="0" press=".onProcess"/>
+						<Button id="btnAnalyzeError" text="{i18n>btnAnalyzeError}" enabled="{ui>/analyzeEnabled}" press=".onAnalyzeError" class="sapUiTinyMarginBegin"/>
 						<Text text="{ui>/fileNameText}" class="sapUiTinyMarginEnd sapUiTinyMarginBegin"/>
 						<ObjectStatus text="{ui>/countText}"/>
 					</Toolbar>

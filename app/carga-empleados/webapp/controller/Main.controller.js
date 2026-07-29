@@ -43,7 +43,8 @@ sap.ui.define([
 				selectedConnection: "",
 				processEnabled: false,
 				hasSelection: false,
-				processing: false
+				processing: false,
+				analyzeEnabled: false
 			}), "ui");
 
 			this.getView().setModel(new JSONModel({
@@ -188,6 +189,7 @@ sap.ui.define([
 				processEnabled: false,
 				hasSelection: false,
 				processing: false,
+				analyzeEnabled: false,
 				fileNameText: "",
 				countText: ""
 			});
@@ -197,6 +199,21 @@ sap.ui.define([
 
 		onRowSelectionChange: function () {
 			this._setUi({ hasSelection: this.byId("employeesTable").getSelectedIndices().length > 0 });
+			this._updateAnalyzeEnabled();
+		},
+
+		/** "Analizar error con IA" is enabled only when exactly one ERROR row is selected. */
+		_updateAnalyzeEnabled: function () {
+			var aSelectedIndices = this.byId("employeesTable").getSelectedIndices();
+			var bEnabled = false;
+
+			if (aSelectedIndices.length === 1) {
+				var aRows = this.getView().getModel("preview").getData().rows;
+				var oRow = aRows[aSelectedIndices[0]];
+				bEnabled = !!oRow && oRow.status === STATUS.ERROR;
+			}
+
+			this._setUi({ analyzeEnabled: bEnabled });
 		},
 
 		onProcess: function () {
@@ -273,10 +290,80 @@ sap.ui.define([
 				this._setUi({ processing: false });
 				this._setStatus(iError > 0 ? "Warning" : "Success", this._text("msgProcessResult", [iOk, iError]));
 				MessageToast.show(this._text("msgProcessResult", [iOk, iError]));
+				this._updateAnalyzeEnabled();
 			}.bind(this)).catch(function () {
 				this._setUi({ processing: false });
 				this._setStatus("Error", this._text("msgProcessError"));
 			}.bind(this));
+		},
+
+		onAnalyzeError: function () {
+			var aSelectedIndices = this.byId("employeesTable").getSelectedIndices();
+			if (aSelectedIndices.length !== 1) {
+				return;
+			}
+
+			var oPreviewData = this.getView().getModel("preview").getData();
+			var oRow = oPreviewData.rows[aSelectedIndices[0]];
+			if (!oRow || oRow.status !== STATUS.ERROR) {
+				return;
+			}
+
+			var oFields = {};
+			oPreviewData.headers.forEach(function (sHeader, iCol) {
+				oFields[sHeader] = oRow["col" + iCol];
+			});
+
+			var oAnalyzeModel = new JSONModel({ loading: true, analysis: "" });
+			this.getView().setModel(oAnalyzeModel, "analyze");
+
+			this._getAnalyzeErrorDialog().then(function (oDialog) {
+				oDialog.open();
+			});
+
+			fetch("/odata/v4/carga-empleados/analyzeErrorWithAI", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					connection: this.getView().getModel("ui").getProperty("/selectedConnection"),
+					fieldsJson: JSON.stringify(oFields),
+					replicationError: oRow.replicationError || ""
+				})
+			}).then(function (oResponse) {
+				if (!oResponse.ok) {
+					return oResponse.json().then(function (oErrorBody) {
+						throw new Error((oErrorBody.error && oErrorBody.error.message) || "HTTP " + oResponse.status);
+					});
+				}
+				return oResponse.json();
+			}).then(function (oResult) {
+				oAnalyzeModel.setProperty("/loading", false);
+				oAnalyzeModel.setProperty("/analysis", oResult.analysis || "");
+			}).catch(function (oError) {
+				oAnalyzeModel.setProperty("/loading", false);
+				oAnalyzeModel.setProperty(
+					"/analysis",
+					this._text("msgAnalyzeErrorError") + (oError && oError.message ? ": " + oError.message : "")
+				);
+			}.bind(this));
+		},
+
+		onCloseAnalyzeError: function () {
+			this.byId("analyzeErrorDialog").close();
+		},
+
+		_getAnalyzeErrorDialog: function () {
+			if (!this._pAnalyzeErrorDialog) {
+				this._pAnalyzeErrorDialog = Fragment.load({
+					id: this.getView().getId(),
+					name: "cargaempleados.view.AnalyzeErrorDialog",
+					controller: this
+				}).then(function (oDialog) {
+					this.getView().addDependent(oDialog);
+					return oDialog;
+				}.bind(this));
+			}
+			return this._pAnalyzeErrorDialog;
 		},
 
 		_renderPreview: function (sCsvText) {
@@ -314,6 +401,7 @@ sap.ui.define([
 				clearEnabled: true,
 				processEnabled: aRows.length > 0,
 				hasSelection: false,
+				analyzeEnabled: false,
 				fileNameText: this._text("previewFileName", [this._oFile.name]),
 				countText: this._text("previewCount", [aRows.length])
 			});

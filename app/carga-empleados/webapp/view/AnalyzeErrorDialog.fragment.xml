@@ -1,0 +1,15 @@
+<core:FragmentDefinition
+	xmlns="sap.m"
+	xmlns:core="sap.ui.core"
+>
+	<Dialog id="analyzeErrorDialog" title="{i18n>analyzeErrorDialogTitle}" contentWidth="32rem" busy="{analyze>/loading}" busyIndicatorDelay="0">
+		<content>
+			<VBox class="sapUiSmallMargin">
+				<Text text="{analyze>/analysis}" wrapping="true"/>
+			</VBox>
+		</content>
+		<endButton>
+			<Button text="{i18n>btnClose}" press=".onCloseAnalyzeError"/>
+		</endButton>
+	</Dialog>
+</core:FragmentDefinition>
